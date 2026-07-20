@@ -1,0 +1,31 @@
+[package]
+name = "open-computer-use"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local MCP server for KDE Wayland computer use"
+
+[dependencies]
+ashpd.workspace = true
+atspi.workspace = true
+atspi-proxies.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+gio.workspace = true
+image.workspace = true
+pipewire.workspace = true
+reis.workspace = true
+rmcp.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+xkbcommon.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

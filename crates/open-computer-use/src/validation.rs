@@ -1,0 +1,474 @@
+use std::collections::BTreeSet;
+
+use serde_json::{Map as JsonObject, Value};
+
+use crate::errors::ValidationError;
+
+pub const MAX_CLICK_COUNT: usize = 3;
+pub const MAX_SCROLL_STEPS: u32 = 100;
+pub const MAX_TEXT_LIMIT: usize = 100_000;
+pub const MAX_TREE_NODES: usize = 5_000;
+pub const MAX_TREE_DEPTH: usize = 128;
+pub const MAX_ELEMENT_ID: usize = MAX_TREE_NODES - 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationScope {
+    Running,
+    Installed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextLimit {
+    Count(usize),
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElementAction {
+    Invoke,
+    Named(String),
+    Focus,
+    SetValue(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointerAction {
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Click {
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        count: usize,
+    },
+    Drag {
+        from: (f64, f64),
+        to: (f64, f64),
+    },
+    Scroll {
+        x: f64,
+        y: f64,
+        delta_x: i32,
+        delta_y: i32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyboardAction {
+    Press(String),
+    Type(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolCall {
+    ListApplications {
+        scope: ApplicationScope,
+    },
+    LaunchApplication {
+        desktop_id: String,
+    },
+    Observe {
+        target: String,
+        text_limit: Option<TextLimit>,
+        max_tree_nodes: Option<usize>,
+        max_tree_depth: Option<usize>,
+    },
+    ActOnElement {
+        state_id: String,
+        element_id: String,
+        action: ElementAction,
+    },
+    Pointer {
+        state_id: String,
+        action: PointerAction,
+    },
+    Keyboard {
+        state_id: String,
+        focus: (f64, f64),
+        action: KeyboardAction,
+    },
+}
+
+impl ToolCall {
+    pub fn is_mutating(&self) -> bool {
+        !matches!(self, Self::ListApplications { .. } | Self::Observe { .. })
+    }
+}
+
+pub fn validate_call(
+    name: &str,
+    mut arguments: JsonObject<String, Value>,
+) -> Result<ToolCall, ValidationError> {
+    let call = match name {
+        "list_applications" => {
+            let scope = match required_string(&mut arguments, "scope")?.as_str() {
+                "running" => ApplicationScope::Running,
+                "installed" => ApplicationScope::Installed,
+                _ => return invalid("scope must be \"running\" or \"installed\""),
+            };
+            ToolCall::ListApplications { scope }
+        }
+        "launch_application" => ToolCall::LaunchApplication {
+            desktop_id: required_desktop_id(&mut arguments, "desktop_id")?,
+        },
+        "observe" => ToolCall::Observe {
+            target: required_nonblank(&mut arguments, "target")?,
+            text_limit: optional_text_limit(&mut arguments, "text_limit")?,
+            max_tree_nodes: optional_bounded_usize(
+                &mut arguments,
+                "max_tree_nodes",
+                MAX_TREE_NODES,
+            )?,
+            max_tree_depth: optional_bounded_usize(
+                &mut arguments,
+                "max_tree_depth",
+                MAX_TREE_DEPTH,
+            )?,
+        },
+        "act_on_element" => ToolCall::ActOnElement {
+            state_id: required_state_id(&mut arguments, "state_id")?,
+            element_id: required_element_id(&mut arguments, "element_id")?,
+            action: element_action(required_object(&mut arguments, "action")?)?,
+        },
+        "pointer" => ToolCall::Pointer {
+            state_id: required_state_id(&mut arguments, "state_id")?,
+            action: pointer_action(required_object(&mut arguments, "action")?)?,
+        },
+        "keyboard" => ToolCall::Keyboard {
+            state_id: required_state_id(&mut arguments, "state_id")?,
+            focus: point(required_object(&mut arguments, "focus")?)?,
+            action: keyboard_action(required_object(&mut arguments, "action")?)?,
+        },
+        _ => return invalid(format!("unknown tool {name:?}")),
+    };
+    reject_unknown(arguments)?;
+    Ok(call)
+}
+
+fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction, ValidationError> {
+    let action = match required_string(&mut object, "type")?.as_str() {
+        "invoke" => ElementAction::Invoke,
+        "named" => ElementAction::Named(required_nonblank(&mut object, "name")?),
+        "focus" => ElementAction::Focus,
+        "set_value" => ElementAction::SetValue(required_string(&mut object, "value")?),
+        _ => return invalid("element action type must be invoke, named, focus, or set_value"),
+    };
+    reject_unknown(object)?;
+    Ok(action)
+}
+
+fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction, ValidationError> {
+    let action = match required_string(&mut object, "type")?.as_str() {
+        "move" => PointerAction::Move {
+            x: required_coordinate(&mut object, "x")?,
+            y: required_coordinate(&mut object, "y")?,
+        },
+        "click" => PointerAction::Click {
+            x: required_coordinate(&mut object, "x")?,
+            y: required_coordinate(&mut object, "y")?,
+            button: optional_button(&mut object, "button")?.unwrap_or(MouseButton::Left),
+            count: optional_bounded_usize(&mut object, "count", MAX_CLICK_COUNT)?.unwrap_or(1),
+        },
+        "drag" => PointerAction::Drag {
+            from: (
+                required_coordinate(&mut object, "from_x")?,
+                required_coordinate(&mut object, "from_y")?,
+            ),
+            to: (
+                required_coordinate(&mut object, "to_x")?,
+                required_coordinate(&mut object, "to_y")?,
+            ),
+        },
+        "scroll" => {
+            let direction = required_string(&mut object, "direction")?;
+            let steps = optional_bounded_u32(&mut object, "steps", MAX_SCROLL_STEPS)?.unwrap_or(1);
+            let amount = i32::try_from(steps)
+                .ok()
+                .and_then(|steps| steps.checked_mul(120))
+                .ok_or_else(|| ValidationError("scroll steps are too large".into()))?;
+            let (delta_x, delta_y) = match direction.as_str() {
+                "up" => (0, -amount),
+                "down" => (0, amount),
+                "left" => (-amount, 0),
+                "right" => (amount, 0),
+                _ => return invalid("direction must be up, down, left, or right"),
+            };
+            PointerAction::Scroll {
+                x: required_coordinate(&mut object, "x")?,
+                y: required_coordinate(&mut object, "y")?,
+                delta_x,
+                delta_y,
+            }
+        }
+        _ => return invalid("pointer action type must be move, click, drag, or scroll"),
+    };
+    reject_unknown(object)?;
+    Ok(action)
+}
+
+fn keyboard_action(
+    mut object: JsonObject<String, Value>,
+) -> Result<KeyboardAction, ValidationError> {
+    let action = match required_string(&mut object, "type")?.as_str() {
+        "press" => {
+            let key = required_nonblank(&mut object, "key")?;
+            if key
+                .split('+')
+                .any(|part| part.trim().eq_ignore_ascii_case("alt"))
+                && key
+                    .split('+')
+                    .any(|part| part.trim().eq_ignore_ascii_case("tab"))
+            {
+                return invalid("desktop focus-switch shortcut Alt+Tab is not allowed");
+            }
+            KeyboardAction::Press(key)
+        }
+        "type" => KeyboardAction::Type(required_string(&mut object, "text")?),
+        _ => return invalid("keyboard action type must be press or type"),
+    };
+    reject_unknown(object)?;
+    Ok(action)
+}
+
+fn point(mut object: JsonObject<String, Value>) -> Result<(f64, f64), ValidationError> {
+    let point = (
+        required_coordinate(&mut object, "x")?,
+        required_coordinate(&mut object, "y")?,
+    );
+    reject_unknown(object)?;
+    Ok(point)
+}
+
+fn required_object(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<JsonObject<String, Value>, ValidationError> {
+    arguments
+        .remove(key)
+        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ValidationError(format!("argument {key:?} must be an object")))
+}
+
+fn required_string(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<String, ValidationError> {
+    arguments
+        .remove(key)
+        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| ValidationError(format!("argument {key:?} must be a string")))
+}
+
+fn required_nonblank(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<String, ValidationError> {
+    let value = required_string(arguments, key)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return invalid(format!("argument {key:?} must not be blank"));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn required_desktop_id(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<String, ValidationError> {
+    let value = required_string(arguments, key)?;
+    if !value.ends_with(".desktop") || value.chars().any(char::is_whitespace) {
+        return invalid(format!(
+            "argument {key:?} must be an exact non-whitespace desktop ID ending in .desktop"
+        ));
+    }
+    Ok(value)
+}
+
+fn required_state_id(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<String, ValidationError> {
+    let value = required_string(arguments, key)?;
+    let valid = value.len() == 18
+        && value.starts_with("s-")
+        && value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid {
+        return invalid(format!(
+            "argument {key:?} must match s- followed by 16 lowercase hexadecimal digits"
+        ));
+    }
+    Ok(value)
+}
+
+fn required_element_id(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<String, ValidationError> {
+    match arguments
+        .remove(key)
+        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
+    {
+        Value::String(value)
+            if value.len() <= 4
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value
+                    .parse::<usize>()
+                    .is_ok_and(|value| value <= MAX_ELEMENT_ID) =>
+        {
+            Ok(value)
+        }
+        Value::Number(value) => {
+            let parsed = value.as_u64().or_else(|| {
+                value.as_f64().and_then(|value| {
+                    (value.is_finite()
+                        && value >= 0.0
+                        && value.fract() == 0.0
+                        && value <= MAX_ELEMENT_ID as f64)
+                        .then_some(value as u64)
+                })
+            });
+            match parsed.and_then(|value| usize::try_from(value).ok()) {
+                Some(value) if value <= MAX_ELEMENT_ID => Ok(value.to_string()),
+                _ => invalid(format!(
+                    "argument {key:?} must be an element ID from 0 through {MAX_ELEMENT_ID}"
+                )),
+            }
+        }
+        _ => invalid(format!(
+            "argument {key:?} must be an element ID from 0 through {MAX_ELEMENT_ID}"
+        )),
+    }
+}
+
+fn required_finite(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<f64, ValidationError> {
+    let value = arguments
+        .remove(key)
+        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
+        .as_f64()
+        .ok_or_else(|| ValidationError(format!("argument {key:?} must be a number")))?;
+    if !value.is_finite() {
+        return invalid(format!("argument {key:?} must be finite"));
+    }
+    Ok(value)
+}
+
+fn required_coordinate(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<f64, ValidationError> {
+    let value = required_finite(arguments, key)?;
+    if value < 0.0 {
+        return invalid(format!("argument {key:?} must be non-negative"));
+    }
+    Ok(value)
+}
+
+fn optional_button(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<Option<MouseButton>, ValidationError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        Some("left") => Ok(Some(MouseButton::Left)),
+        Some("right") => Ok(Some(MouseButton::Right)),
+        Some("middle") => Ok(Some(MouseButton::Middle)),
+        _ => invalid(format!("argument {key:?} must be left, right, or middle")),
+    }
+}
+
+fn optional_bounded_u32(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+    maximum: u32,
+) -> Result<Option<u32>, ValidationError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| (1..=maximum).contains(value))
+        .ok_or_else(|| {
+            ValidationError(format!(
+                "argument {key:?} must be an integer from 1 through {maximum}"
+            ))
+        })?;
+    Ok(Some(value))
+}
+
+fn optional_bounded_usize(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+    maximum: usize,
+) -> Result<Option<usize>, ValidationError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=maximum).contains(value))
+        .ok_or_else(|| {
+            ValidationError(format!(
+                "argument {key:?} must be an integer from 1 through {maximum}"
+            ))
+        })?;
+    Ok(Some(value))
+}
+
+fn optional_text_limit(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<Option<TextLimit>, ValidationError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(None);
+    };
+    if value.as_str() == Some("max") {
+        return Ok(Some(TextLimit::Max));
+    }
+    let count = value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            ValidationError(format!("argument {key:?} must be an integer or \"max\""))
+        })?;
+    if count > MAX_TEXT_LIMIT {
+        return invalid(format!("argument {key:?} must not exceed {MAX_TEXT_LIMIT}"));
+    }
+    Ok(Some(TextLimit::Count(count)))
+}
+
+fn reject_unknown(arguments: JsonObject<String, Value>) -> Result<(), ValidationError> {
+    if arguments.is_empty() {
+        return Ok(());
+    }
+    let keys = arguments.keys().cloned().collect::<BTreeSet<_>>();
+    invalid(format!(
+        "unknown argument(s): {}",
+        keys.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
+fn invalid<T>(message: impl Into<String>) -> Result<T, ValidationError> {
+    Err(ValidationError(message.into()))
+}
