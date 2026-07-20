@@ -45,9 +45,12 @@ AT-SPI active flag or global window position, neither of which KDE exposes
 reliably.
 
 `observe` uses bounded depth-first traversal with per-adapter-call and whole
-snapshot timeouts. Cached elements carry their D-Bus object identity, tree path,
-accessible ID, role, full name, window-relative extents, PID, window identity,
-and generation. The runtime keeps one global current observation. Semantic
+snapshot timeouts. Cached elements carry their D-Bus object identity, depth,
+role, full name, and validated window-relative extents. The immutable committed
+snapshot carries the PID, window identity, generation, and traversal limits.
+The runtime keeps one global current observation as a shared snapshot plus a
+separate, mutable, single-use screenshot mapping. A new snapshot commit always
+starts without a mapping. Semantic
 actions require its exact opaque `state_id` and the same current accessible
 object, role, and name; replacement objects or stale IDs require `observe`.
 Explicit element focus targets the freshly revalidated accessible object through
@@ -60,11 +63,11 @@ the service re-discovers the app, verifies the PID and exact window, traverses
 fresh state, and relocates any generation-scoped element. After a bounded settle
 delay it re-resolves the same app/window and returns a new observation.
 
-Mutating calls share one server-side barrier. Each call rechecks the current
-cache generation after it acquires that barrier, so a request that waited behind
-another mutation cannot act on stale state. Cancellation cleanup completes
-inside the same barrier before the next mutation starts. Cleanup has a bounded
-deadline; a timeout closes the desktop session rather than blocking later work.
+All tool calls share one server-side execution barrier so cancellation cleanup
+finishes before any queued call starts. Stateful actions recheck the current
+cache generation after acquiring that barrier and cannot act on stale state.
+Cleanup has a bounded deadline; a failure or timeout closes the desktop session
+rather than blocking later work.
 
 Each operation has one implementation route. `list_applications` lists running
 AT-SPI applications or installed desktop entries. `launch_application` resolves
@@ -81,6 +84,12 @@ geometry. Keyboard tools also require a full-monitor screenshot point and
 left-click it before sending keys because EIS targets the active seat, not an
 application. Missing semantic support or generated-input prerequisites return
 an error; no route falls back.
+
+Capability inspection is fail-closed. A failed interface query cannot produce
+any claimed capability. Action inspection separately records no Action
+interface, a successful empty or populated action list, or inspection failure;
+focus, editable text, and numeric value support remain available when only
+action inspection fails.
 
 Successful element, pointer, and keyboard actions settle, observe, and return a
 replacement state ID. Generated input requires the latest screenshot mapping and a fresh AT-SPI read

@@ -113,14 +113,11 @@ pub async fn scroll(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::backend::{InputCapabilities, InputEvent, test_support::FakeBackend};
+    use crate::input::backend::{InputEvent, test_support::FakeBackend};
 
     #[tokio::test]
     async fn move_pointer_emits_no_button_event() {
-        let fake = FakeBackend::new(InputCapabilities {
-            absolute_pointer: true,
-            ..InputCapabilities::default()
-        });
+        let fake = FakeBackend::new();
         move_pointer(fake.clone(), 10.0, 20.0).await.unwrap();
         assert_eq!(
             *fake.events.lock().unwrap(),
@@ -130,11 +127,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn click_emits_complete_counted_button_sequences() {
-        let fake = FakeBackend::new(InputCapabilities {
-            absolute_pointer: true,
-            button: true,
-            ..InputCapabilities::default()
-        });
+        let fake = FakeBackend::new();
         click(
             fake.clone(),
             10.0,
@@ -170,7 +163,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn drag_ends_exactly_and_cleans_up_on_error_and_cancellation() {
-        let fake = FakeBackend::new(InputCapabilities::default());
+        let fake = FakeBackend::new();
         drag(fake.clone(), (1.0, 2.0), (17.0, 18.0)).await.unwrap();
         assert_eq!(
             fake.events.lock().unwrap().last(),
@@ -184,7 +177,7 @@ mod tests {
             InputEvent::Absolute { x: 17.0, y: 18.0 }
         );
 
-        let failing = FakeBackend::new(InputCapabilities::default());
+        let failing = FakeBackend::new();
         failing
             .fail_at
             .store(3, std::sync::atomic::Ordering::Release);
@@ -202,7 +195,7 @@ mod tests {
             })
         );
 
-        let cancelled = FakeBackend::new(InputCapabilities::default());
+        let cancelled = FakeBackend::new();
         let task = tokio::spawn(drag(cancelled.clone(), (0.0, 0.0), (20.0, 20.0)));
         sleep(Duration::from_millis(20)).await;
         task.abort();
@@ -215,11 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn scroll_moves_then_emits_one_discrete_wheel_event() {
-        let fake = FakeBackend::new(InputCapabilities {
-            absolute_pointer: true,
-            scroll: true,
-            ..InputCapabilities::default()
-        });
+        let fake = FakeBackend::new();
         scroll(fake.clone(), 10.0, 20.0, 0, 240).await.unwrap();
         assert_eq!(
             *fake.events.lock().unwrap(),

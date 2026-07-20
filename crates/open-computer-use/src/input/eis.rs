@@ -21,17 +21,17 @@ use xkbcommon::xkb;
 use crate::portal::PortalSessionLease;
 
 use super::{
-    backend::{HeldInput, InputBackend, InputCapabilities, InputEvent, InputFuture},
+    backend::{HeldInput, InputBackend, InputEvent, InputFuture, KeyboardKey},
     coordinates::EisRegion,
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone)]
-struct MonitorRoute {
-    mapping_id: Option<String>,
-    position: (i32, i32),
-    size: (i32, i32),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EisCapabilities {
+    pub button: bool,
+    pub scroll: bool,
+    pub keyboard: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +68,7 @@ impl EisState {
         }
     }
 
-    fn pointer_region(&self, route: &MonitorRoute) -> Result<Option<(u64, EisRegion)>, String> {
+    fn pointer_device(&self, route: &EisRegion) -> Result<Option<u64>, String> {
         let mut matches = Vec::new();
         for (&id, state) in &self.devices {
             if !state.resumed || state.device.interface::<ei::PointerAbsolute>().is_none() {
@@ -85,24 +85,13 @@ impl EisState {
                     i32::try_from(region.height)
                         .map_err(|_| "EIS region height exceeds i32 range")?,
                 );
-                let mapping_matches = match route.mapping_id.as_deref() {
-                    Some(mapping_id) => region.mapping_id.as_deref() == Some(mapping_id),
-                    None => true,
-                };
-                if mapping_matches && position == route.position && size == route.size {
-                    matches.push((
-                        id,
-                        EisRegion {
-                            position,
-                            size,
-                            mapping_id: region.mapping_id.clone(),
-                        },
-                    ));
+                if region_matches_route(route, region.mapping_id.as_deref(), position, size) {
+                    matches.push(id);
                 }
             }
         }
         match matches.as_slice() {
-            [one] => Ok(Some(one.clone())),
+            [id] => Ok(Some(*id)),
             [] => Ok(None),
             many => Err(format!(
                 "{} resumed EIS regions exactly match the selected monitor stream; refusing ambiguous input",
@@ -180,6 +169,19 @@ struct SyncRequest {
     response: oneshot::Sender<Result<(), String>>,
 }
 
+#[derive(Default)]
+struct CleanupState {
+    held: Vec<HeldInput>,
+    sequence_pending: bool,
+}
+
+struct EisThread {
+    shutdown: Option<UnixStream>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    done: std::sync::mpsc::Receiver<()>,
+    stopping: Arc<AtomicBool>,
+}
+
 impl EisAttemptGuard {
     fn new(session: Arc<PortalSessionLease>) -> Result<Self, String> {
         session.begin_eis_attempt()?;
@@ -207,25 +209,19 @@ impl Drop for EisAttemptGuard {
 
 pub struct ReisInputBackend {
     session: Arc<PortalSessionLease>,
-    route: MonitorRoute,
+    route: EisRegion,
     state: Arc<Mutex<EisState>>,
     ready: Arc<Notify>,
-    cleanup: Mutex<Vec<HeldInput>>,
-    cleanup_sequence: Mutex<bool>,
+    cleanup: Mutex<CleanupState>,
     serial: tokio::sync::Mutex<()>,
-    shutdown: Mutex<Option<UnixStream>>,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    thread_done: Mutex<std::sync::mpsc::Receiver<()>>,
-    stopping: Arc<AtomicBool>,
+    thread: Mutex<EisThread>,
     sync_requests: mpsc::UnboundedSender<SyncRequest>,
 }
 
 impl ReisInputBackend {
     pub async fn connect(
         session: Arc<PortalSessionLease>,
-        mapping_id: Option<String>,
-        position: (i32, i32),
-        size: (i32, i32),
+        route: EisRegion,
     ) -> Result<Arc<Self>, String> {
         let attempt = EisAttemptGuard::new(Arc::clone(&session))?;
         let socket = session.connect_to_eis().await?;
@@ -257,20 +253,17 @@ impl ReisInputBackend {
             .map_err(|error| format!("cannot start EIS event thread: {error}"))?;
         let backend = Arc::new(Self {
             session,
-            route: MonitorRoute {
-                mapping_id,
-                position,
-                size,
-            },
+            route,
             state,
             ready,
-            cleanup: Mutex::new(Vec::new()),
-            cleanup_sequence: Mutex::new(false),
+            cleanup: Mutex::new(CleanupState::default()),
             serial: tokio::sync::Mutex::new(()),
-            shutdown: Mutex::new(Some(shutdown)),
-            thread: Mutex::new(Some(thread)),
-            thread_done: Mutex::new(thread_done),
-            stopping,
+            thread: Mutex::new(EisThread {
+                shutdown: Some(shutdown),
+                handle: Some(thread),
+                done: thread_done,
+                stopping,
+            }),
             sync_requests,
         });
         tokio::time::timeout(READY_TIMEOUT, backend.wait_ready(false))
@@ -290,11 +283,11 @@ impl ReisInputBackend {
                 if let Some(error) = &state.terminal {
                     return Err(error.clone());
                 }
-                if let Some((pointer, region)) = state.pointer_region(&self.route)? {
+                if let Some(pointer) = state.pointer_device(&self.route)? {
                     let keyboard_ready =
                         !keyboard_required || state.keyboard_device(pointer)?.is_some();
                     if keyboard_ready {
-                        return Ok(region);
+                        return Ok(self.route.clone());
                     }
                 }
             }
@@ -323,12 +316,31 @@ impl ReisInputBackend {
         if let Some(error) = &state.terminal {
             return Err(error.clone());
         }
-        state
-            .pointer_region(&self.route)?
-            .map(|(_, region)| region)
-            .ok_or_else(|| {
-                "no resumed EIS region exactly matches the selected monitor stream".into()
-            })
+        state.pointer_device(&self.route)?.ok_or_else(|| {
+            "no resumed EIS region exactly matches the selected monitor stream".to_owned()
+        })?;
+        Ok(self.route.clone())
+    }
+
+    pub fn capabilities(&self) -> Result<EisCapabilities, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "EIS state mutex poisoned".to_owned())?;
+        let id = state
+            .pointer_device(&self.route)?
+            .ok_or("exact EIS pointer region is no longer resumed")?;
+        let button = state
+            .devices
+            .get(&id)
+            .is_some_and(|device| device.device.interface::<ei::Button>().is_some());
+        let scroll = state.scroll_device(id)?.is_some();
+        let keyboard = state.keyboard_device(id)?.is_some();
+        Ok(EisCapabilities {
+            button,
+            scroll,
+            keyboard,
+        })
     }
 
     pub fn resolve_keysyms(&self, keysyms: &[u32]) -> Result<Vec<ResolvedKey>, String> {
@@ -337,8 +349,7 @@ impl ReisInputBackend {
             .lock()
             .map_err(|_| "EIS state mutex poisoned".to_owned())?;
         let pointer_id = state
-            .pointer_region(&self.route)?
-            .map(|(id, _)| id)
+            .pointer_device(&self.route)?
             .ok_or("exact EIS pointer region is no longer resumed")?;
         let id = state
             .keyboard_device(pointer_id)?
@@ -355,22 +366,9 @@ impl ReisInputBackend {
         let (depressed, latched, locked, group) = device
             .modifiers
             .ok_or("EIS keyboard modifiers are not synchronized")?;
-        if latched != 0 {
-            return Err(
-                "a physical latched modifier is active; refusing generated keyboard input".into(),
-            );
-        }
+        validate_physical_modifiers(&keymap, (depressed, latched, locked, group))?;
         xkb_state.update_mask(depressed, latched, locked, 0, 0, group);
         let active = xkb_state.serialize_mods(xkb::STATE_MODS_EFFECTIVE);
-        let shortcut_modifiers = modifier_mask(
-            &keymap,
-            &[xkb::MOD_NAME_CTRL, xkb::MOD_NAME_ALT, xkb::MOD_NAME_LOGO],
-        );
-        if active & shortcut_modifiers != 0 {
-            return Err(
-                "physical Ctrl, Alt, or Super is active; refusing generated keyboard input".into(),
-            );
-        }
         keysyms
             .iter()
             .map(|&keysym| {
@@ -442,13 +440,11 @@ impl ReisInputBackend {
     fn selected_device(&self, state: &EisState, event: &InputEvent) -> Result<u64, String> {
         match event {
             InputEvent::Absolute { .. } | InputEvent::Button { .. } => state
-                .pointer_region(&self.route)?
-                .map(|(id, _)| id)
+                .pointer_device(&self.route)?
                 .ok_or_else(|| "exact EIS pointer region is no longer resumed".into()),
             InputEvent::ScrollDiscrete { .. } => {
                 let pointer = state
-                    .pointer_region(&self.route)?
-                    .map(|(id, _)| id)
+                    .pointer_device(&self.route)?
                     .ok_or("exact EIS pointer region is no longer resumed")?;
                 state
                     .scroll_device(pointer)?
@@ -456,8 +452,7 @@ impl ReisInputBackend {
             }
             InputEvent::Keycode { key, .. } => {
                 let pointer = state
-                    .pointer_region(&self.route)?
-                    .map(|(id, _)| id)
+                    .pointer_device(&self.route)?
                     .ok_or("exact EIS pointer region is no longer resumed")?;
                 let current = state
                     .keyboard_device(pointer)?
@@ -466,12 +461,7 @@ impl ReisInputBackend {
                     .devices
                     .get(&key.device_id)
                     .ok_or("resolved EIS keyboard disappeared")?;
-                if current != key.device_id || device.resume_generation != key.resume_generation {
-                    return Err(
-                        "EIS keyboard changed after key resolution; inspect fresh state and retry"
-                            .into(),
-                    );
-                }
+                validate_key_binding(current, device.resume_generation, *key)?;
                 Ok(current)
             }
         }
@@ -493,8 +483,7 @@ impl ReisInputBackend {
             .clone()
             .ok_or("EIS connection is not ready")?;
         let pointer_id = state
-            .pointer_region(&self.route)?
-            .map(|(id, _)| id)
+            .pointer_device(&self.route)?
             .ok_or("exact EIS pointer region is no longer resumed")?;
         let device = state
             .devices
@@ -656,36 +645,6 @@ impl ReisInputBackend {
 }
 
 impl InputBackend for ReisInputBackend {
-    fn capabilities(&self) -> InputCapabilities {
-        let (absolute_pointer, button, scroll, keyboard) = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .pointer_region(&self.route)
-                    .ok()
-                    .flatten()
-                    .map(|(id, _)| (state, id))
-            })
-            .map(|(state, id)| {
-                let button = state
-                    .devices
-                    .get(&id)
-                    .is_some_and(|device| device.device.interface::<ei::Button>().is_some());
-                let scroll = state.scroll_device(id).ok().flatten().is_some();
-                let keyboard = state.keyboard_device(id).ok().flatten().is_some();
-                (true, button, scroll, keyboard)
-            })
-            .unwrap_or((false, false, false, false));
-        InputCapabilities {
-            absolute_pointer,
-            button,
-            scroll,
-            keyboard,
-        }
-    }
-
     fn begin_sequence(&self) -> InputFuture<'_> {
         Box::pin(async move {
             let _serial = self.serial.lock().await;
@@ -696,10 +655,10 @@ impl InputBackend for ReisInputBackend {
                 .map(|state| state.devices.values().any(|device| device.emulating))
                 .unwrap_or(true);
             if sequence_open {
-                *self
-                    .cleanup_sequence
+                self.cleanup
                     .lock()
-                    .map_err(|_| "EIS cleanup sequence mutex poisoned".to_owned())? = true;
+                    .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
+                    .sequence_pending = true;
             }
             result
         })
@@ -714,7 +673,7 @@ impl InputBackend for ReisInputBackend {
 
     fn queue_release(&self, held: Vec<HeldInput>) {
         match self.cleanup.lock() {
-            Ok(mut cleanup) => cleanup.extend(held),
+            Ok(mut cleanup) => cleanup.held.extend(held),
             Err(_) => {
                 eprintln!("open-computer-use: EIS cleanup mutex poisoned; invalidating session");
                 self.session.invalidate("EIS cleanup mutex poisoned");
@@ -725,34 +684,34 @@ impl InputBackend for ReisInputBackend {
     fn cleanup_barrier(&self) -> InputFuture<'_> {
         Box::pin(async move {
             let _serial = self.serial.lock().await;
-            let held = self
-                .cleanup
-                .lock()
-                .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
-                .clone();
-            let sequence_pending = *self
-                .cleanup_sequence
-                .lock()
-                .map_err(|_| "EIS cleanup sequence mutex poisoned".to_owned())?;
+            let (held, sequence_pending) = {
+                let cleanup = self
+                    .cleanup
+                    .lock()
+                    .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?;
+                (cleanup.held.clone(), cleanup.sequence_pending)
+            };
             if held.is_empty() && !sequence_pending {
                 return Ok(());
             }
             if !sequence_pending {
                 self.begin_inner()?;
-                *self
-                    .cleanup_sequence
+                self.cleanup
                     .lock()
-                    .map_err(|_| "EIS cleanup sequence mutex poisoned".to_owned())? = true;
+                    .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
+                    .sequence_pending = true;
             }
             let mut first = None;
             for input in held {
                 match self.emit_inner(input.release_event()) {
                     Ok(()) => {
                         if let Ok(mut cleanup) = self.cleanup.lock()
-                            && let Some(index) =
-                                cleanup.iter().rposition(|candidate| *candidate == input)
+                            && let Some(index) = cleanup
+                                .held
+                                .iter()
+                                .rposition(|candidate| *candidate == input)
                         {
-                            cleanup.remove(index);
+                            cleanup.held.remove(index);
                         }
                     }
                     Err(error) => {
@@ -765,10 +724,10 @@ impl InputBackend for ReisInputBackend {
                     if let Err(error) = self.synchronize(keyboard).await {
                         first.get_or_insert(error);
                     }
-                    *self
-                        .cleanup_sequence
+                    self.cleanup
                         .lock()
-                        .map_err(|_| "EIS cleanup sequence mutex poisoned".to_owned())? = false;
+                        .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
+                        .sequence_pending = false;
                 }
                 Err(error) => {
                     first.get_or_insert(error);
@@ -785,28 +744,24 @@ impl InputBackend for ReisInputBackend {
 
 impl Drop for ReisInputBackend {
     fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
-        if let Ok(mut socket) = self.shutdown.lock()
-            && let Some(socket) = socket.take()
-        {
+        let Ok(mut thread) = self.thread.lock() else {
+            eprintln!("open-computer-use: EIS thread mutex poisoned during shutdown");
+            self.session.invalidate("EIS thread mutex poisoned");
+            return;
+        };
+        thread.stopping.store(true, Ordering::Release);
+        if let Some(socket) = thread.shutdown.take() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
-        if let Ok(mut thread) = self.thread.lock()
-            && let Some(thread) = thread.take()
-        {
-            if self
-                .thread_done
-                .lock()
-                .map(|receiver| receiver.recv_timeout(Duration::from_secs(1)))
-                .unwrap_or(Err(std::sync::mpsc::RecvTimeoutError::Disconnected))
-                .is_ok()
-            {
-                let _ = thread.join();
-            } else {
-                eprintln!(
-                    "open-computer-use: EIS event thread did not stop within one second; detaching it"
-                );
-            }
+        let Some(handle) = thread.handle.take() else {
+            return;
+        };
+        if thread.done.recv_timeout(Duration::from_secs(1)).is_ok() {
+            let _ = handle.join();
+        } else {
+            eprintln!(
+                "open-computer-use: EIS event thread did not stop within one second; detaching it"
+            );
         }
     }
 }
@@ -992,7 +947,7 @@ fn handle_event(
                     Some(device) => {
                         device.resumed = true;
                         device.resume_generation = device.resume_generation.wrapping_add(1);
-                        device.modifiers = Some((0, 0, 0, 0));
+                        device.modifiers = None;
                         device.modifiers_synced = false;
                         device.keymap.is_some()
                             && device.device.interface::<ei::Keyboard>().is_some()
@@ -1152,19 +1107,26 @@ fn ensure_safe_physical_modifiers(device: &DeviceState) -> Result<(), String> {
             .ok_or("EIS keyboard lost its keymap")?
             .clone(),
     )?;
-    let (depressed, latched, locked, group) = device
+    let modifiers = device
         .modifiers
         .ok_or("EIS keyboard modifiers are not synchronized")?;
+    validate_physical_modifiers(&keymap, modifiers)
+}
+
+fn validate_physical_modifiers(
+    keymap: &xkb::Keymap,
+    (depressed, latched, locked, group): (u32, u32, u32, u32),
+) -> Result<(), String> {
     if latched != 0 {
         return Err(
             "a physical latched modifier is active; refusing generated keyboard input".into(),
         );
     }
-    let mut state = xkb::State::new(&keymap);
+    let mut state = xkb::State::new(keymap);
     state.update_mask(depressed, latched, locked, 0, 0, group);
     let active = state.serialize_mods(xkb::STATE_MODS_EFFECTIVE);
     let shortcuts = modifier_mask(
-        &keymap,
+        keymap,
         &[xkb::MOD_NAME_CTRL, xkb::MOD_NAME_ALT, xkb::MOD_NAME_LOGO],
     );
     if active & shortcuts != 0 {
@@ -1245,6 +1207,33 @@ fn validate_event(event: &InputEvent) -> Result<(), String> {
     Ok(())
 }
 
+fn region_matches_route(
+    route: &EisRegion,
+    mapping_id: Option<&str>,
+    position: (i32, i32),
+    size: (i32, i32),
+) -> bool {
+    route.position == position
+        && route.size == size
+        && route
+            .mapping_id
+            .as_deref()
+            .is_none_or(|expected| mapping_id == Some(expected))
+}
+
+fn validate_key_binding(
+    current_device_id: u64,
+    current_resume_generation: u64,
+    key: KeyboardKey,
+) -> Result<(), String> {
+    if current_device_id != key.device_id || current_resume_generation != key.resume_generation {
+        return Err(
+            "EIS keyboard changed after key resolution; inspect fresh state and retry".into(),
+        );
+    }
+    Ok(())
+}
+
 fn f32_value(value: f64) -> Result<f32, String> {
     let value = value as f32;
     value
@@ -1285,5 +1274,44 @@ mod tests {
         let second = monotonic_microseconds();
         assert!(first > 0);
         assert!(second >= first);
+    }
+
+    #[test]
+    fn route_matching_requires_exact_geometry_and_recorded_mapping_id() {
+        let route = EisRegion {
+            position: (-1920, 0),
+            size: (1920, 1080),
+            mapping_id: Some("monitor-1".into()),
+        };
+        assert!(region_matches_route(
+            &route,
+            Some("monitor-1"),
+            (-1920, 0),
+            (1920, 1080)
+        ));
+        assert!(!region_matches_route(
+            &route,
+            Some("monitor-2"),
+            (-1920, 0),
+            (1920, 1080)
+        ));
+        assert!(!region_matches_route(
+            &route,
+            Some("monitor-1"),
+            (0, 0),
+            (1920, 1080)
+        ));
+    }
+
+    #[test]
+    fn resolved_keys_are_bound_to_device_and_resume_generation() {
+        let key = KeyboardKey {
+            device_id: 4,
+            resume_generation: 7,
+            keycode: 30,
+        };
+        assert!(validate_key_binding(4, 7, key).is_ok());
+        assert!(validate_key_binding(5, 7, key).is_err());
+        assert!(validate_key_binding(4, 8, key).is_err());
     }
 }

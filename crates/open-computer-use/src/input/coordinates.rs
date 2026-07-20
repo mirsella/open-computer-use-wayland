@@ -23,18 +23,20 @@ impl<'a> ValidatedMapping<'a> {
     pub fn eis_mapper(self, region: EisRegion) -> Result<AbsoluteMapper<'a>, String> {
         let position = self
             .mapping
-            .stream_position
+            .stream
+            .position
             .ok_or_else(|| "selected monitor stream has no compositor position".to_owned())?;
         let size = self
             .mapping
-            .stream_logical_size
+            .stream
+            .logical_size
             .ok_or_else(|| "selected monitor stream has no logical size".to_owned())?;
         if region.position != position || region.size != size {
             return Err(
                 "selected EIS region geometry does not exactly match the monitor stream".into(),
             );
         }
-        if let Some(mapping_id) = self.mapping.mapping_id.as_deref()
+        if let Some(mapping_id) = self.mapping.stream.mapping_id.as_deref()
             && region.mapping_id.as_deref() != Some(mapping_id)
         {
             return Err("selected EIS region mapping_id does not match the monitor stream".into());
@@ -64,7 +66,7 @@ impl AbsoluteMapper<'_> {
         if !png_x.is_finite() || !png_y.is_finite() {
             return Err("screenshot coordinates must be finite".into());
         }
-        let (png_width, png_height) = self.mapping.output_png_size;
+        let (png_width, png_height) = self.mapping.output.size;
         if png_x < 0.0
             || png_y < 0.0
             || png_x >= f64::from(png_width)
@@ -75,14 +77,14 @@ impl AbsoluteMapper<'_> {
             ));
         }
 
-        let transformed_x = f64::from(self.mapping.transformed_monitor_crop.x)
-            + png_x * self.mapping.png_to_transformed_x;
-        let transformed_y = f64::from(self.mapping.transformed_monitor_crop.y)
-            + png_y * self.mapping.png_to_transformed_y;
-        let x = transformed_x / self.mapping.scale_x;
-        let y = transformed_y / self.mapping.scale_y;
+        let transformed_x = f64::from(self.mapping.monitor.transformed_crop.x)
+            + png_x * self.mapping.output.png_to_transformed_x;
+        let transformed_y = f64::from(self.mapping.monitor.transformed_crop.y)
+            + png_y * self.mapping.output.png_to_transformed_y;
+        let x = transformed_x / self.mapping.monitor.scale_x;
+        let y = transformed_y / self.mapping.monitor.scale_y;
         let (logical_width, logical_height) =
-            self.mapping.stream_logical_size.ok_or_else(|| {
+            self.mapping.stream.logical_size.ok_or_else(|| {
                 "selected stream has no logical size for absolute input mapping".to_owned()
             })?;
         if x < 0.0 || y < 0.0 || x >= f64::from(logical_width) || y >= f64::from(logical_height) {
@@ -124,27 +126,23 @@ fn validate_mapping(
     {
         return Err("portal session identity is stale or closed".into());
     }
-    if !mapping.scale_x.is_finite()
-        || !mapping.scale_y.is_finite()
-        || mapping.scale_x <= 0.0
-        || mapping.scale_y <= 0.0
-        || !mapping.png_to_transformed_x.is_finite()
-        || !mapping.png_to_transformed_y.is_finite()
-        || mapping.png_to_transformed_x <= 0.0
-        || mapping.png_to_transformed_y <= 0.0
-        || mapping.output_png_size.0 == 0
-        || mapping.output_png_size.1 == 0
+    if session.granted_devices() != mapping.remote_desktop_devices {
+        return Err("portal session granted-device mask changed since screenshot capture".into());
+    }
+    if !mapping.monitor.scale_x.is_finite()
+        || !mapping.monitor.scale_y.is_finite()
+        || mapping.monitor.scale_x <= 0.0
+        || mapping.monitor.scale_y <= 0.0
+        || !mapping.output.png_to_transformed_x.is_finite()
+        || !mapping.output.png_to_transformed_y.is_finite()
+        || mapping.output.png_to_transformed_x <= 0.0
+        || mapping.output.png_to_transformed_y <= 0.0
+        || mapping.output.size.0 == 0
+        || mapping.output.size.1 == 0
     {
         return Err("screenshot mapping has invalid scale or output bounds".into());
     }
-    if stream.stream_index != mapping.stream_index
-        || stream.node_id != mapping.pipewire_node_id
-        || stream.pipewire_serial != mapping.pipewire_serial
-        || stream.id != mapping.stream_id
-        || stream.mapping_id != mapping.mapping_id
-        || stream.position != mapping.stream_position
-        || stream.logical_size != mapping.stream_logical_size
-    {
+    if stream != &mapping.stream {
         return Err("live portal stream metadata changed".into());
     }
     Ok(())
@@ -156,9 +154,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        accessibility::{AppInfo, ObjectId, Snapshot, WindowInfo},
-        encoder::encode_with_limits,
-        geometry::{PixelRect, Transform},
+        accessibility::{AppInfo, ObjectId, Snapshot, SnapshotLimits, WindowInfo},
+        capture::FrameMetadata,
+        encoder::{PngMapping, encode_with_limits},
+        geometry::{MonitorMapping, PixelRect, Transform},
         portal::GrantedDevices,
     };
 
@@ -187,10 +186,11 @@ mod tests {
             elements: Vec::new(),
             node_limit_reached: false,
             depth_limit_reached: false,
-            text_limit: 20,
-            max_nodes: 20,
-            max_depth: 5,
-            screenshot_mapping: None,
+            limits: SnapshotLimits {
+                text: 20,
+                nodes: 20,
+                depth: 5,
+            },
         };
         let mapping = ScreenshotMapping {
             app_pid: 9,
@@ -200,34 +200,42 @@ mod tests {
             portal_session_identity: "/session/test".into(),
             portal_session_generation: 4,
             remote_desktop_devices: GrantedDevices::from_mask_for_mapping(3),
-            stream_index: 0,
-            stream_id: Some("stream".into()),
-            stream_position: Some((-1600, 0)),
-            stream_logical_size: Some((400, 300)),
-            pipewire_node_id: 22,
-            pipewire_serial: Some(33),
-            source_frame_generation: 8,
-            source_format_generation: 1,
-            source_frame_size: (600, 450),
-            original_frame_crop: PixelRect {
-                x: 0,
-                y: 0,
-                width: 600,
-                height: 450,
+            stream: PortalStream {
+                stream_index: 0,
+                node_id: 22,
+                pipewire_serial: Some(33),
+                id: Some("stream".into()),
+                mapping_id: Some("map".into()),
+                position: Some((-1600, 0)),
+                logical_size: Some((400, 300)),
             },
-            transformed_monitor_crop: PixelRect {
-                x: 0,
-                y: 0,
-                width: 600,
-                height: 450,
+            source: FrameMetadata {
+                generation: 8,
+                format_generation: 1,
+                size: (600, 450),
+                crop: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 600,
+                    height: 450,
+                },
+                transform,
             },
-            output_png_size: (600, 450),
-            png_to_transformed_x: 1.0,
-            png_to_transformed_y: 1.0,
-            scale_x: 1.5,
-            scale_y: 1.5,
-            transform,
-            mapping_id: Some("map".into()),
+            monitor: MonitorMapping {
+                transformed_crop: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 600,
+                    height: 450,
+                },
+                scale_x: 1.5,
+                scale_y: 1.5,
+            },
+            output: PngMapping {
+                size: (600, 450),
+                png_to_transformed_x: 1.0,
+                png_to_transformed_y: 1.0,
+            },
         };
         let stream = PortalStream {
             stream_index: 0,
@@ -251,9 +259,9 @@ mod tests {
     ) -> Result<(f64, f64), String> {
         ValidatedMapping::new(snapshot, mapping, session, stream)?
             .eis_mapper(EisRegion {
-                position: mapping.stream_position.unwrap(),
-                size: mapping.stream_logical_size.unwrap(),
-                mapping_id: mapping.mapping_id.clone(),
+                position: mapping.stream.position.unwrap(),
+                size: mapping.stream.logical_size.unwrap(),
+                mapping_id: mapping.stream.mapping_id.clone(),
             })?
             .point(x, y)
     }
@@ -304,6 +312,12 @@ mod tests {
                 .unwrap_err()
                 .contains("changed")
         );
+        let (different_grants, _) = PortalSessionLease::for_test("/session/test", 4, 1);
+        assert!(
+            map_png_point(&snapshot, &mapping, &different_grants, &stream, 1.0, 1.0)
+                .unwrap_err()
+                .contains("granted-device mask")
+        );
         closed.send_replace(true);
         assert!(
             map_png_point(&snapshot, &mapping, &session, &stream, 1.0, 1.0)
@@ -341,23 +355,21 @@ mod tests {
             1_000,
         )
         .unwrap();
-        assert!(encoded.width.max(encoded.height) <= 30);
+        assert!(encoded.mapping.size.0.max(encoded.mapping.size.1) <= 30);
         assert!(encoded.bytes.len() <= 1_000);
-        assert!(encoded.png_to_transformed_x > 1.0);
-        assert!(encoded.png_to_transformed_y > 1.0);
+        assert!(encoded.mapping.png_to_transformed_x > 1.0);
+        assert!(encoded.mapping.png_to_transformed_y > 1.0);
 
         let (snapshot, mut mapping, mut stream) = fixture(Transform::Rotate90);
-        mapping.transformed_monitor_crop = output_crop;
-        mapping.output_png_size = (encoded.width, encoded.height);
-        mapping.png_to_transformed_x = encoded.png_to_transformed_x;
-        mapping.png_to_transformed_y = encoded.png_to_transformed_y;
-        mapping.scale_x = 1.25;
-        mapping.scale_y = 1.5;
-        mapping.stream_logical_size = Some((1000, 1000));
+        mapping.monitor.transformed_crop = output_crop;
+        mapping.output = encoded.mapping;
+        mapping.monitor.scale_x = 1.25;
+        mapping.monitor.scale_y = 1.5;
+        mapping.stream.logical_size = Some((1000, 1000));
         stream.logical_size = Some((1000, 1000));
         let (session, _) = PortalSessionLease::for_test("/session/test", 4, 3);
-        let png_x = f64::from(encoded.width) * 0.25;
-        let png_y = f64::from(encoded.height) * 0.75;
+        let png_x = f64::from(mapping.output.size.0) * 0.25;
+        let png_y = f64::from(mapping.output.size.1) * 0.75;
         let point = map_png_point(&snapshot, &mapping, &session, &stream, png_x, png_y).unwrap();
         let expected_x =
             -1600.0 + (f64::from(output_crop.x) + f64::from(output_crop.width) * 0.25) / 1.25;

@@ -8,7 +8,6 @@ use std::{
         unix::{fs::PermissionsExt, net::UnixStream},
     },
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -35,7 +34,16 @@ pub(crate) const PORTAL_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 const TOKEN_MAX_BYTES: usize = 16 * 1024;
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-pub type PortalFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+fn next_session_generation(counter: &AtomicU64) -> Result<u64, String> {
+    let previous = counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+            generation.checked_add(1)
+        })
+        .map_err(|_| "portal session generation overflow".to_owned())?;
+    previous
+        .checked_add(1)
+        .ok_or_else(|| "portal session generation overflow".to_owned())
+}
 
 #[derive(Debug, Clone)]
 pub struct PortalConfig {
@@ -61,17 +69,14 @@ impl PortalConfig {
 
     fn from_persistence_value(value: Option<&str>) -> Self {
         let persist_restore_token = match value {
-            Some(value) => match value {
-                "1" | "true" => true,
-                "0" | "false" => false,
-                _ => {
-                    eprintln!(
-                        "open-computer-use: invalid OPEN_COMPUTER_USE_PERSIST_PORTAL={value:?}; persistence remains enabled"
-                    );
-                    true
-                }
-            },
-            None => true,
+            None | Some("1" | "true") => true,
+            Some("0" | "false") => false,
+            Some(value) => {
+                eprintln!(
+                    "open-computer-use: invalid OPEN_COMPUTER_USE_PERSIST_PORTAL={value:?}; persistence remains enabled"
+                );
+                true
+            }
         };
         Self {
             persist_restore_token,
@@ -146,39 +151,33 @@ impl GrantedDevices {
 }
 
 pub trait PortalBackend: Send + Sync + 'static {
-    fn establish(&self) -> PortalFuture<'_, PortalConnection>;
-    fn capabilities(&self) -> PortalFuture<'_, PortalCapabilities>;
+    fn establish(&self) -> impl Future<Output = Result<PortalConnection, String>> + Send + '_;
+    fn capabilities(&self) -> impl Future<Output = Result<PortalCapabilities, String>> + Send + '_;
 }
 
 #[derive(Debug)]
 pub struct XdgPortalBackend {
-    config: PortalConfig,
     token_store: Option<RestoreTokenStore>,
 }
 
 impl XdgPortalBackend {
-    pub fn new(mut config: PortalConfig) -> Self {
+    pub fn new(config: PortalConfig) -> Self {
         let token_store = if config.persist_restore_token {
             match RestoreTokenStore::xdg() {
                 Ok(store) => Some(store),
                 Err(error) => {
                     eprintln!("open-computer-use: restore-token persistence disabled: {error}");
-                    config.persist_restore_token = false;
                     None
                 }
             }
         } else {
             None
         };
-        Self {
-            config,
-            token_store,
-        }
+        Self { token_store }
     }
 
     pub(crate) fn persistent() -> Result<Self, String> {
         Ok(Self {
-            config: PortalConfig::default(),
             token_store: Some(RestoreTokenStore::xdg()?),
         })
     }
@@ -225,7 +224,7 @@ impl XdgPortalBackend {
                 );
             }
         })));
-        let mut session_guard = SessionCloseGuard::new(session_proxy.clone());
+        let session_guard = CloseGuard::new(session_proxy.clone(), "portal session");
 
         let request_token = random_token("create")?;
         let mut request = RawRequest::new(&connection, &request_token).await?;
@@ -236,9 +235,7 @@ impl XdgPortalBackend {
             .call("CreateSession", &options)
             .await
             .map_err(portal_error)?;
-        let mut response = request
-            .response(returned, "CreateSession", Some(&closed))
-            .await?;
+        let mut response = request.response(returned, "CreateSession", &closed).await?;
         let returned_session = take_string(&mut response, "session_handle")?;
         if returned_session != session_path {
             eprintln!(
@@ -281,7 +278,7 @@ impl XdgPortalBackend {
             &connection,
             &remote,
             &session_path,
-            self.config.persist_restore_token,
+            self.token_store.is_some(),
             restore_token.as_deref(),
             &closed,
         )
@@ -314,8 +311,8 @@ impl XdgPortalBackend {
             capabilities.screencast_version,
         )?;
         let mut restore_token_saved = false;
-        if self.config.persist_restore_token && complete_grant {
-            let restore_token = match take_optional_string(&mut start_results, "restore_token") {
+        if complete_grant && let Some(store) = &self.token_store {
+            let restore_token = match take_optional::<String>(&mut start_results, "restore_token") {
                 Ok(token) => token,
                 Err(error) => {
                     eprintln!(
@@ -325,34 +322,23 @@ impl XdgPortalBackend {
                 }
             };
             match restore_token {
-                Some(token) => {
-                    if let Some(store) = &self.token_store {
-                        match store.save(&token) {
-                            Ok(()) => {
-                                restore_token_saved = true;
-                                eprintln!(
-                                    "open-computer-use: saved a private one-shot portal restore token"
-                                );
-                            }
-                            Err(error) => eprintln!(
-                                "open-computer-use: portal session is usable, but its replacement restore token could not be saved: {error}"
-                            ),
-                        }
-                    } else {
+                Some(token) => match store.save(&token) {
+                    Ok(()) => {
+                        restore_token_saved = true;
                         eprintln!(
-                            "open-computer-use: portal session is usable, but restore-token storage is unavailable"
+                            "open-computer-use: saved a private one-shot portal restore token"
                         );
                     }
-                }
+                    Err(error) => eprintln!(
+                        "open-computer-use: portal session is usable, but its replacement restore token could not be saved: {error}"
+                    ),
+                },
                 None => eprintln!(
                     "open-computer-use: portal granted the session without a restore token; persistence is unavailable for this backend/choice"
                 ),
             }
         }
-        let generation = SESSION_GENERATION
-            .fetch_add(1, Ordering::AcqRel)
-            .checked_add(1)
-            .ok_or_else(|| "portal session generation overflow".to_owned())?;
+        let generation = next_session_generation(&SESSION_GENERATION)?;
         let lease = Arc::new(PortalSessionLease {
             path: session_path,
             generation,
@@ -361,7 +347,7 @@ impl XdgPortalBackend {
             closed_sender,
             connection: Some(connection),
             input_state: Mutex::new(EisConnectionState::Available),
-            _close_guard: Mutex::new(session_guard.disarm()),
+            _close_guard: Mutex::new(session_guard),
             _close_monitor: close_monitor,
         });
         Ok(PortalApproval {
@@ -400,22 +386,20 @@ impl Default for XdgPortalBackend {
 }
 
 impl PortalBackend for XdgPortalBackend {
-    fn establish(&self) -> PortalFuture<'_, PortalConnection> {
-        Box::pin(self.establish_inner())
+    fn establish(&self) -> impl Future<Output = Result<PortalConnection, String>> + Send + '_ {
+        self.establish_inner()
     }
 
-    fn capabilities(&self) -> PortalFuture<'_, PortalCapabilities> {
-        Box::pin(async {
-            require_wayland()?;
-            let connection = Connection::session().await.map_err(portal_error)?;
-            let remote = RemoteDesktop::with_connection(connection.clone())
-                .await
-                .map_err(portal_error)?;
-            let screencast = Screencast::with_connection(connection)
-                .await
-                .map_err(portal_error)?;
-            read_capabilities(&remote, &screencast).await
-        })
+    async fn capabilities(&self) -> Result<PortalCapabilities, String> {
+        require_wayland()?;
+        let connection = Connection::session().await.map_err(portal_error)?;
+        let remote = RemoteDesktop::with_connection(connection.clone())
+            .await
+            .map_err(portal_error)?;
+        let screencast = Screencast::with_connection(connection)
+            .await
+            .map_err(portal_error)?;
+        read_capabilities(&remote, &screencast).await
     }
 }
 
@@ -442,7 +426,7 @@ pub struct PortalSessionLease {
     closed_sender: watch::Sender<bool>,
     connection: Option<Connection>,
     input_state: Mutex<EisConnectionState>,
-    _close_guard: Mutex<SessionCloseGuard>,
+    _close_guard: Mutex<CloseGuard>,
     _close_monitor: CloseMonitor,
 }
 
@@ -570,10 +554,10 @@ impl PortalSessionLease {
                 ._close_guard
                 .lock()
                 .map_err(|_| "portal session close mutex poisoned".to_owned())?;
-            match guard.0.as_ref() {
-                Some(SessionCloseTarget::Proxy(proxy)) => Some(proxy.clone()),
+            match guard.target.as_ref() {
+                Some(CloseTarget::Proxy(proxy)) => Some(proxy.clone()),
                 #[cfg(test)]
-                Some(SessionCloseTarget::Probe(probe)) => {
+                Some(CloseTarget::Probe(probe)) => {
                     probe.fetch_add(1, Ordering::AcqRel);
                     None
                 }
@@ -615,7 +599,7 @@ impl PortalSessionLease {
                 closed_sender: sender.clone(),
                 connection: None,
                 input_state: Mutex::new(EisConnectionState::Available),
-                _close_guard: Mutex::new(SessionCloseGuard(None)),
+                _close_guard: Mutex::new(CloseGuard::empty("portal session")),
                 _close_monitor: CloseMonitor(None),
             }),
             sender,
@@ -704,9 +688,7 @@ async fn select_devices(
         .call("SelectDevices", &(path, options))
         .await
         .map_err(portal_error)?;
-    request
-        .response(returned, "SelectDevices", Some(closed))
-        .await?;
+    request.response(returned, "SelectDevices", closed).await?;
     Ok(())
 }
 
@@ -732,9 +714,7 @@ async fn select_sources(
         .call("SelectSources", &(path, options))
         .await
         .map_err(portal_error)?;
-    request
-        .response(returned, "SelectSources", Some(closed))
-        .await?;
+    request.response(returned, "SelectSources", closed).await?;
     Ok(())
 }
 
@@ -753,14 +733,14 @@ async fn start_remote_desktop(
         .call("Start", &(path, "", options))
         .await
         .map_err(portal_error)?;
-    request.response(returned, "Start", Some(closed)).await
+    request.response(returned, "Start", closed).await
 }
 
 struct RawRequest {
     expected_path: String,
     proxy: Proxy<'static>,
     stream: MessageStream,
-    guard: RequestCloseGuard,
+    guard: CloseGuard,
 }
 
 impl RawRequest {
@@ -789,7 +769,7 @@ impl RawRequest {
         )
         .await
         .map_err(portal_error)?;
-        let guard = RequestCloseGuard::new(proxy.clone());
+        let guard = CloseGuard::new(proxy.clone(), "cancelled portal request");
         Ok(Self {
             expected_path,
             proxy,
@@ -802,7 +782,7 @@ impl RawRequest {
         &mut self,
         returned: OwnedObjectPath,
         operation: &str,
-        closed: Option<&watch::Receiver<bool>>,
+        closed: &watch::Receiver<bool>,
     ) -> Result<HashMap<String, OwnedValue>, String> {
         if returned.as_str() != self.expected_path {
             eprintln!(
@@ -818,7 +798,7 @@ impl RawRequest {
             .await
             .map_err(portal_error)?;
             self.guard.disarm();
-            self.guard = RequestCloseGuard::new(self.proxy.clone());
+            self.guard = CloseGuard::new(self.proxy.clone(), "cancelled portal request");
         }
         let returned_path = self.proxy.path().as_str().to_owned();
         let message =
@@ -837,47 +817,33 @@ async fn wait_for_request_response<S>(
     stream: &mut S,
     returned_path: &str,
     operation: &str,
-    closed: Option<&watch::Receiver<bool>>,
+    closed: &watch::Receiver<bool>,
 ) -> Result<zbus::Message, String>
 where
     S: futures_util::Stream<Item = zbus::Result<zbus::Message>> + Unpin,
 {
-    if let Some(closed) = closed {
-        let mut closed = closed.clone();
-        loop {
-            if *closed.borrow() {
-                return Err(format!(
-                    "portal RemoteDesktop session closed during {operation}"
-                ));
-            }
-            tokio::select! {
-                message = stream.next() => {
-                    let message = message
-                        .ok_or_else(|| format!("portal {operation} request disappeared without a Response signal"))?
-                        .map_err(portal_error)?;
-                    if message_matches_path(&message, returned_path) {
-                        return Ok(message);
-                    }
-                }
-                changed = closed.changed() => {
-                    if changed.is_err() || *closed.borrow() {
-                        return Err(format!("portal RemoteDesktop session closed during {operation}"));
-                    }
-                    return Err(format!("portal session close monitor changed unexpectedly during {operation}"));
-                }
-            }
-        }
-    }
+    let mut closed = closed.clone();
     loop {
-        let message = stream
-            .next()
-            .await
-            .ok_or_else(|| {
-                format!("portal {operation} request disappeared without a Response signal")
-            })?
-            .map_err(portal_error)?;
-        if message_matches_path(&message, returned_path) {
-            return Ok(message);
+        if *closed.borrow() {
+            return Err(format!(
+                "portal RemoteDesktop session closed during {operation}"
+            ));
+        }
+        tokio::select! {
+            message = stream.next() => {
+                let message = message
+                    .ok_or_else(|| format!("portal {operation} request disappeared without a Response signal"))?
+                    .map_err(portal_error)?;
+                if message_matches_path(&message, returned_path) {
+                    return Ok(message);
+                }
+            }
+            changed = closed.changed() => {
+                if changed.is_err() || *closed.borrow() {
+                    return Err(format!("portal RemoteDesktop session closed during {operation}"));
+                }
+                return Err(format!("portal session close monitor changed unexpectedly during {operation}"));
+            }
         }
     }
 }
@@ -900,46 +866,82 @@ fn classify_response(code: u32, operation: &str) -> Result<(), String> {
     }
 }
 
-enum RequestCloseTarget {
+enum CloseTarget {
     Proxy(Proxy<'static>),
     #[cfg(test)]
     Probe(Arc<std::sync::atomic::AtomicUsize>),
 }
 
-struct RequestCloseGuard(Option<RequestCloseTarget>);
+struct CloseGuard {
+    target: Option<CloseTarget>,
+    label: &'static str,
+}
 
-impl RequestCloseGuard {
-    fn new(proxy: Proxy<'static>) -> Self {
-        Self(Some(RequestCloseTarget::Proxy(proxy)))
+impl CloseGuard {
+    fn new(proxy: Proxy<'static>, label: &'static str) -> Self {
+        Self {
+            target: Some(CloseTarget::Proxy(proxy)),
+            label,
+        }
     }
 
     fn disarm(&mut self) {
-        self.0 = None;
+        self.target = None;
+    }
+
+    fn close_now(&mut self, label: &'static str, connection: Option<&Connection>) {
+        match self.target.take() {
+            Some(CloseTarget::Proxy(proxy)) => close_proxy(proxy, label, connection.cloned()),
+            #[cfg(test)]
+            Some(CloseTarget::Probe(probe)) => {
+                probe.fetch_add(1, Ordering::AcqRel);
+            }
+            None => {}
+        }
+    }
+
+    fn take(&mut self) -> Option<CloseTarget> {
+        self.target.take()
+    }
+
+    #[cfg(test)]
+    fn empty(label: &'static str) -> Self {
+        Self {
+            target: None,
+            label,
+        }
     }
 }
 
-impl Drop for RequestCloseGuard {
+impl std::fmt::Debug for CloseGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloseGuard")
+            .field("label", &self.label)
+            .field(
+                "target",
+                &self.target.as_ref().map(|target| match target {
+                    CloseTarget::Proxy(proxy) => proxy.path().as_str(),
+                    #[cfg(test)]
+                    CloseTarget::Probe(_) => "test-probe",
+                }),
+            )
+            .finish()
+    }
+}
+
+impl Drop for CloseGuard {
     fn drop(&mut self) {
-        match self.0.take() {
-            Some(RequestCloseTarget::Proxy(proxy)) => {
-                close_proxy(proxy, "cancelled portal request", None);
-            }
+        match self.target.take() {
+            Some(CloseTarget::Proxy(proxy)) => close_proxy(proxy, self.label, None),
             #[cfg(test)]
-            Some(RequestCloseTarget::Probe(probe)) => {
+            Some(CloseTarget::Probe(probe)) => {
                 probe.fetch_add(1, Ordering::AcqRel);
             }
             None => {}
         }
     }
 }
-
-enum SessionCloseTarget {
-    Proxy(Proxy<'static>),
-    #[cfg(test)]
-    Probe(Arc<std::sync::atomic::AtomicUsize>),
-}
-
-struct SessionCloseGuard(Option<SessionCloseTarget>);
 
 struct CloseMonitor(Option<tokio::task::JoinHandle<()>>);
 
@@ -947,59 +949,6 @@ impl Drop for CloseMonitor {
     fn drop(&mut self) {
         if let Some(task) = self.0.take() {
             task.abort();
-        }
-    }
-}
-
-impl SessionCloseGuard {
-    fn new(proxy: Proxy<'static>) -> Self {
-        Self(Some(SessionCloseTarget::Proxy(proxy)))
-    }
-
-    fn disarm(&mut self) -> Self {
-        Self(self.0.take())
-    }
-
-    fn close_now(&mut self, label: &'static str, connection: Option<&Connection>) {
-        match self.0.take() {
-            Some(SessionCloseTarget::Proxy(proxy)) => {
-                close_proxy(proxy, label, connection.cloned())
-            }
-            #[cfg(test)]
-            Some(SessionCloseTarget::Probe(probe)) => {
-                probe.fetch_add(1, Ordering::AcqRel);
-            }
-            None => {}
-        }
-    }
-
-    fn take(&mut self) -> Option<SessionCloseTarget> {
-        self.0.take()
-    }
-}
-
-impl std::fmt::Debug for SessionCloseGuard {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_tuple("SessionCloseGuard")
-            .field(&self.0.as_ref().map(|target| match target {
-                SessionCloseTarget::Proxy(proxy) => proxy.path().as_str(),
-                #[cfg(test)]
-                SessionCloseTarget::Probe(_) => "test-probe",
-            }))
-            .finish()
-    }
-}
-
-impl Drop for SessionCloseGuard {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(SessionCloseTarget::Proxy(proxy)) => close_proxy(proxy, "portal session", None),
-            #[cfg(test)]
-            Some(SessionCloseTarget::Probe(probe)) => {
-                probe.fetch_add(1, Ordering::AcqRel);
-            }
-            None => {}
         }
     }
 }
@@ -1079,8 +1028,8 @@ fn parse_stream(
     mut properties: HashMap<String, OwnedValue>,
     screencast_version: u32,
 ) -> Result<PortalStream, String> {
-    let id = take_optional_string(&mut properties, "id")?;
-    let mapping_id = take_optional_string(&mut properties, "mapping_id")?;
+    let id = take_optional::<String>(&mut properties, "id")?;
+    let mapping_id = take_optional::<String>(&mut properties, "mapping_id")?;
     let position = take_optional::<(i32, i32)>(&mut properties, "position")?;
     let logical_size = take_optional::<(i32, i32)>(&mut properties, "size")?;
     let source_raw = take_optional::<u32>(&mut properties, "source_type")?;
@@ -1127,13 +1076,6 @@ fn take_string(values: &mut HashMap<String, OwnedValue>, name: &str) -> Result<S
     take_owned(values, name)?
         .try_into()
         .map_err(|error| format!("portal response {name} has the wrong type: {error}"))
-}
-
-fn take_optional_string(
-    values: &mut HashMap<String, OwnedValue>,
-    name: &str,
-) -> Result<Option<String>, String> {
-    take_optional(values, name)
 }
 
 fn take_optional<T>(
@@ -1360,11 +1302,13 @@ mod tests {
 
     use super::*;
 
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temp_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "ocu-{name}-{}-{}",
             std::process::id(),
-            SESSION_GENERATION.fetch_add(1, Ordering::Relaxed)
+            TEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
         ))
     }
 
@@ -1490,7 +1434,8 @@ mod tests {
         assert!(!message_matches_path(&expected_message, returned));
         assert!(message_matches_path(&returned_message, returned));
         let mut stream = futures_util::stream::iter([Ok(expected_message), Ok(returned_message)]);
-        let response = wait_for_request_response(&mut stream, returned, "Start", None)
+        let (_sender, closed) = watch::channel(false);
+        let response = wait_for_request_response(&mut stream, returned, "Start", &closed)
             .await
             .unwrap();
         assert!(message_matches_path(&response, returned));
@@ -1505,7 +1450,7 @@ mod tests {
             &mut stream,
             "/org/freedesktop/portal/desktop/request/1_2/start",
             "Start",
-            Some(&receiver),
+            &receiver,
         )
         .await
         .unwrap_err();
@@ -1516,13 +1461,17 @@ mod tests {
     fn cancelled_request_guard_closes_once_and_completed_request_does_not_close() {
         let close_count = Arc::new(AtomicUsize::new(0));
         {
-            let _guard =
-                RequestCloseGuard(Some(RequestCloseTarget::Probe(Arc::clone(&close_count))));
+            let _guard = CloseGuard {
+                target: Some(CloseTarget::Probe(Arc::clone(&close_count))),
+                label: "cancelled portal request",
+            };
         }
         assert_eq!(close_count.load(AtomicOrdering::Acquire), 1);
         {
-            let mut guard =
-                RequestCloseGuard(Some(RequestCloseTarget::Probe(Arc::clone(&close_count))));
+            let mut guard = CloseGuard {
+                target: Some(CloseTarget::Probe(Arc::clone(&close_count))),
+                label: "cancelled portal request",
+            };
             guard.disarm();
         }
         assert_eq!(close_count.load(AtomicOrdering::Acquire), 1);
@@ -1532,9 +1481,11 @@ mod tests {
     fn session_cleanup_guard_closes_exactly_once() {
         let close_count = Arc::new(AtomicUsize::new(0));
         {
-            let mut guard =
-                SessionCloseGuard(Some(SessionCloseTarget::Probe(Arc::clone(&close_count))));
-            let _owner = guard.disarm();
+            let mut guard = CloseGuard {
+                target: Some(CloseTarget::Probe(Arc::clone(&close_count))),
+                label: "portal session",
+            };
+            guard.close_now("portal session", None);
         }
         assert_eq!(close_count.load(AtomicOrdering::Acquire), 1);
     }
@@ -1564,10 +1515,15 @@ mod tests {
     }
 
     #[test]
-    fn session_generation_is_monotonic() {
+    fn session_generation_is_monotonic_and_does_not_wrap() {
+        let counter = AtomicU64::new(0);
         let values = (0..100)
-            .map(|_| SESSION_GENERATION.fetch_add(1, Ordering::AcqRel))
+            .map(|_| next_session_generation(&counter).unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(values.len(), 100);
+
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert!(next_session_generation(&exhausted).is_err());
+        assert_eq!(exhausted.load(AtomicOrdering::Acquire), u64::MAX);
     }
 }

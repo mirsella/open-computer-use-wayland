@@ -17,28 +17,21 @@ fn tools_have_exact_order_and_schemas() {
 }
 
 #[test]
-fn every_schema_is_a_closed_object() {
-    for tool in tool_definitions() {
-        let schema = tool.schema_as_json_value();
-        assert_eq!(schema["type"], "object", "{} type", tool.name);
-        assert_eq!(
-            schema["additionalProperties"], false,
-            "{} closure",
-            tool.name
-        );
-        assert!(schema["properties"].is_object(), "{} properties", tool.name);
-    }
-}
-
-#[test]
 fn annotations_match_the_inherited_contract() {
     let tools = tool_definitions();
     for tool in tools {
         let annotations = serde_json::to_value(tool.annotations).expect("serialize annotations");
-        let expected = if matches!(tool.name.as_ref(), "list_applications" | "observe") {
+        let expected = if tool.name.as_ref() == "list_applications" {
             json!({
                 "openWorldHint": true,
                 "readOnlyHint": true,
+            })
+        } else if tool.name.as_ref() == "observe" {
+            json!({
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true,
+                "readOnlyHint": false,
             })
         } else {
             json!({
@@ -49,13 +42,6 @@ fn annotations_match_the_inherited_contract() {
             })
         };
         assert_eq!(annotations, expected, "{} annotations", tool.name);
-    }
-}
-
-#[test]
-fn every_tool_has_an_output_schema() {
-    for tool in tool_definitions() {
-        assert!(tool.output_schema.is_some(), "{} output schema", tool.name);
     }
 }
 

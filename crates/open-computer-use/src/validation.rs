@@ -98,12 +98,6 @@ pub enum ToolCall {
     },
 }
 
-impl ToolCall {
-    pub fn is_mutating(&self) -> bool {
-        !matches!(self, Self::ListApplications { .. } | Self::Observe { .. })
-    }
-}
-
 pub fn validate_call(
     name: &str,
     mut arguments: JsonObject<String, Value>,
@@ -123,16 +117,8 @@ pub fn validate_call(
         "observe" => ToolCall::Observe {
             target: required_nonblank(&mut arguments, "target")?,
             text_limit: optional_text_limit(&mut arguments, "text_limit")?,
-            max_tree_nodes: optional_bounded_usize(
-                &mut arguments,
-                "max_tree_nodes",
-                MAX_TREE_NODES,
-            )?,
-            max_tree_depth: optional_bounded_usize(
-                &mut arguments,
-                "max_tree_depth",
-                MAX_TREE_DEPTH,
-            )?,
+            max_tree_nodes: optional_bounded(&mut arguments, "max_tree_nodes", MAX_TREE_NODES)?,
+            max_tree_depth: optional_bounded(&mut arguments, "max_tree_depth", MAX_TREE_DEPTH)?,
         },
         "act_on_element" => ToolCall::ActOnElement {
             state_id: required_state_id(&mut arguments, "state_id")?,
@@ -168,29 +154,26 @@ fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction
 
 fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction, ValidationError> {
     let action = match required_string(&mut object, "type")?.as_str() {
-        "move" => PointerAction::Move {
-            x: required_coordinate(&mut object, "x")?,
-            y: required_coordinate(&mut object, "y")?,
-        },
-        "click" => PointerAction::Click {
-            x: required_coordinate(&mut object, "x")?,
-            y: required_coordinate(&mut object, "y")?,
-            button: optional_button(&mut object, "button")?.unwrap_or(MouseButton::Left),
-            count: optional_bounded_usize(&mut object, "count", MAX_CLICK_COUNT)?.unwrap_or(1),
-        },
+        "move" => {
+            let (x, y) = coordinate_pair(&mut object, "x", "y")?;
+            PointerAction::Move { x, y }
+        }
+        "click" => {
+            let (x, y) = coordinate_pair(&mut object, "x", "y")?;
+            PointerAction::Click {
+                x,
+                y,
+                button: optional_button(&mut object, "button")?.unwrap_or(MouseButton::Left),
+                count: optional_bounded(&mut object, "count", MAX_CLICK_COUNT)?.unwrap_or(1),
+            }
+        }
         "drag" => PointerAction::Drag {
-            from: (
-                required_coordinate(&mut object, "from_x")?,
-                required_coordinate(&mut object, "from_y")?,
-            ),
-            to: (
-                required_coordinate(&mut object, "to_x")?,
-                required_coordinate(&mut object, "to_y")?,
-            ),
+            from: coordinate_pair(&mut object, "from_x", "from_y")?,
+            to: coordinate_pair(&mut object, "to_x", "to_y")?,
         },
         "scroll" => {
             let direction = required_string(&mut object, "direction")?;
-            let steps = optional_bounded_u32(&mut object, "steps", MAX_SCROLL_STEPS)?.unwrap_or(1);
+            let steps = optional_bounded(&mut object, "steps", MAX_SCROLL_STEPS)?.unwrap_or(1);
             let amount = i32::try_from(steps)
                 .ok()
                 .and_then(|steps| steps.checked_mul(120))
@@ -202,9 +185,10 @@ fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction
                 "right" => (amount, 0),
                 _ => return invalid("direction must be up, down, left, or right"),
             };
+            let (x, y) = coordinate_pair(&mut object, "x", "y")?;
             PointerAction::Scroll {
-                x: required_coordinate(&mut object, "x")?,
-                y: required_coordinate(&mut object, "y")?,
+                x,
+                y,
                 delta_x,
                 delta_y,
             }
@@ -240,21 +224,25 @@ fn keyboard_action(
 }
 
 fn point(mut object: JsonObject<String, Value>) -> Result<(f64, f64), ValidationError> {
-    let point = (
-        required_coordinate(&mut object, "x")?,
-        required_coordinate(&mut object, "y")?,
-    );
+    let point = coordinate_pair(&mut object, "x", "y")?;
     reject_unknown(object)?;
     Ok(point)
+}
+
+fn required(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<Value, ValidationError> {
+    arguments
+        .remove(key)
+        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))
 }
 
 fn required_object(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
 ) -> Result<JsonObject<String, Value>, ValidationError> {
-    arguments
-        .remove(key)
-        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
+    required(arguments, key)?
         .as_object()
         .cloned()
         .ok_or_else(|| ValidationError(format!("argument {key:?} must be an object")))
@@ -264,9 +252,7 @@ fn required_string(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
 ) -> Result<String, ValidationError> {
-    arguments
-        .remove(key)
-        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
+    required(arguments, key)?
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| ValidationError(format!("argument {key:?} must be a string")))
@@ -319,10 +305,7 @@ fn required_element_id(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
 ) -> Result<String, ValidationError> {
-    match arguments
-        .remove(key)
-        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
-    {
+    match required(arguments, key)? {
         Value::String(value)
             if value.len() <= 4
                 && value.bytes().all(|byte| byte.is_ascii_digit())
@@ -359,9 +342,7 @@ fn required_finite(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
 ) -> Result<f64, ValidationError> {
-    let value = arguments
-        .remove(key)
-        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))?
+    let value = required(arguments, key)?
         .as_f64()
         .ok_or_else(|| ValidationError(format!("argument {key:?} must be a number")))?;
     if !value.is_finite() {
@@ -381,6 +362,17 @@ fn required_coordinate(
     Ok(value)
 }
 
+fn coordinate_pair(
+    arguments: &mut JsonObject<String, Value>,
+    x: &str,
+    y: &str,
+) -> Result<(f64, f64), ValidationError> {
+    Ok((
+        required_coordinate(arguments, x)?,
+        required_coordinate(arguments, y)?,
+    ))
+}
+
 fn optional_button(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
@@ -396,38 +388,20 @@ fn optional_button(
     }
 }
 
-fn optional_bounded_u32(
+fn optional_bounded<T>(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-    maximum: u32,
-) -> Result<Option<u32>, ValidationError> {
+    maximum: T,
+) -> Result<Option<T>, ValidationError>
+where
+    T: Copy + From<u8> + PartialOrd + std::fmt::Display + TryFrom<u64>,
+{
     let Some(value) = arguments.remove(key) else {
         return Ok(None);
     };
-    let value = value
-        .as_u64()
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| (1..=maximum).contains(value))
-        .ok_or_else(|| {
-            ValidationError(format!(
-                "argument {key:?} must be an integer from 1 through {maximum}"
-            ))
-        })?;
-    Ok(Some(value))
-}
-
-fn optional_bounded_usize(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-    maximum: usize,
-) -> Result<Option<usize>, ValidationError> {
-    let Some(value) = arguments.remove(key) else {
-        return Ok(None);
-    };
-    let value = value
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| (1..=maximum).contains(value))
+    let value = json_integer(&value)
+        .and_then(|value| T::try_from(value).ok())
+        .filter(|value| (T::from(1)..=maximum).contains(value))
         .ok_or_else(|| {
             ValidationError(format!(
                 "argument {key:?} must be an integer from 1 through {maximum}"
@@ -446,8 +420,7 @@ fn optional_text_limit(
     if value.as_str() == Some("max") {
         return Ok(Some(TextLimit::Max));
     }
-    let count = value
-        .as_u64()
+    let count = json_integer(&value)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| {
             ValidationError(format!("argument {key:?} must be an integer or \"max\""))
@@ -456,6 +429,14 @@ fn optional_text_limit(
         return invalid(format!("argument {key:?} must not exceed {MAX_TEXT_LIMIT}"));
     }
     Ok(Some(TextLimit::Count(count)))
+}
+
+fn json_integer(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        let value = value.as_f64()?;
+        (value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64)
+            .then_some(value as u64)
+    })
 }
 
 fn reject_unknown(arguments: JsonObject<String, Value>) -> Result<(), ValidationError> {

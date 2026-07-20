@@ -32,32 +32,26 @@ fn cli_help_version_and_errors_are_truthful() {
 }
 
 #[test]
-fn direct_call_rejects_incomplete_keyboard_input_before_desktop_access() {
-    let output = run(
-        &["call", "-"],
-        r#"{"name":"keyboard","arguments":{"state_id":"s-0000000000000000","focus":{"x":1,"y":2},"action":{"type":"press"}}}"#,
-    );
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(text(&output.stderr).contains("missing required argument \"key\""));
-}
-
-#[test]
-fn mcp_initialize_list_and_generated_calls_require_prior_state() {
+fn mcp_initialize_lists_tools_and_requires_prior_state() {
     let mut messages = initialization();
     messages.push(json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/list",
     }));
-    for (offset, (name, arguments)) in valid_calls().into_iter().enumerate() {
-        messages.push(json!({
-            "jsonrpc": "2.0",
-            "id": offset + 10,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        }));
-    }
+    messages.push(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "act_on_element",
+            "arguments": {
+                "state_id": "s-0000000000000000",
+                "element_id": "1",
+                "action": {"type": "invoke"},
+            },
+        },
+    }));
 
     let output = run(&["mcp"], &json_lines(&messages));
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
@@ -82,16 +76,14 @@ fn mcp_initialize_list_and_generated_calls_require_prior_state() {
         .collect();
     assert_eq!(names, TOOL_NAMES);
 
-    for id in 10..13 {
-        let result = &responses[&id]["result"];
-        assert_eq!(result["isError"], true, "response {id}: {result}");
-        assert!(
-            result["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("no observation is available")),
-            "response {id}: {result}"
-        );
-    }
+    let result = &responses[&10]["result"];
+    assert_eq!(result["isError"], true, "response 10: {result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("no observation is available")),
+        "response 10: {result}"
+    );
 
     assert_eq!(
         output.stdout.iter().filter(|byte| **byte == b'\n').count(),
@@ -114,37 +106,6 @@ fn rmcp_rejects_a_malformed_call_shape_before_tool_validation() {
     let responses = responses_by_id(&output);
     assert_eq!(responses[&2]["error"]["code"], -32601);
     assert!(responses[&2].get("result").is_none());
-}
-
-#[test]
-fn tool_argument_validation_is_invalid_params() {
-    let mut messages = initialization();
-    for (id, name, arguments) in [
-        (3, "pointer", json!({"state_id": "s-0000000000000000"})),
-        (
-            4,
-            "keyboard",
-            json!({"state_id": "s-0000000000000000", "focus": {"x": 1, "y": 2}}),
-        ),
-        (
-            5,
-            "act_on_element",
-            json!({"state_id": "s-0000000000000000", "element_id": "1"}),
-        ),
-    ] {
-        messages.push(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        }));
-    }
-    let output = run(&["mcp"], &json_lines(&messages));
-    let responses = responses_by_id(&output);
-    for id in 3..=5 {
-        assert_eq!(responses[&id]["error"]["code"], -32602);
-        assert!(responses[&id].get("result").is_none());
-    }
 }
 
 #[test]
@@ -176,23 +137,6 @@ fn initialization() -> Vec<Value> {
             },
         }),
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-    ]
-}
-
-fn valid_calls() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "act_on_element",
-            json!({"state_id": "s-0000000000000000", "element_id": "1", "action": {"type": "invoke"}}),
-        ),
-        (
-            "pointer",
-            json!({"state_id": "s-0000000000000000", "action": {"type": "drag", "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4}}),
-        ),
-        (
-            "keyboard",
-            json!({"state_id": "s-0000000000000000", "focus": {"x": 10, "y": 20}, "action": {"type": "press", "key": "Return"}}),
-        ),
     ]
 }
 

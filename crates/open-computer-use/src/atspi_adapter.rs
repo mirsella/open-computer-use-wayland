@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, future::Future};
 
 use atspi::{CoordType, Interface};
 use atspi_proxies::{
@@ -15,8 +15,8 @@ use zbus::{Connection, fdo::DBusProxy, names::BusName, proxy::CacheProperties};
 
 use crate::{
     accessibility::{
-        AccessibilityAdapter, ActionInfo, AdapterFuture, AppInfo, NodeInfo, ObjectId, Rect,
-        SemanticAction, WindowInfo,
+        AccessibilityAdapter, ActionCapabilities, ActionInfo, AppInfo, InspectedCapabilities,
+        NodeCapabilities, NodeInfo, ObjectId, Rect, SemanticAction, WindowInfo,
     },
     errors::RuntimeError,
 };
@@ -234,19 +234,12 @@ impl AtspiAdapter {
             .into_iter()
             .map(|state| state.to_string())
             .collect();
-        let interfaces = proxy.get_interfaces().await;
-        let interface_inspection_failed = interfaces.is_err();
-        let interface_set =
-            optional(object, "Accessible", "GetInterfaces", interfaces).unwrap_or_default();
-        let editable_text = interface_set.contains(Interface::EditableText);
-        let value_interface = interface_set.contains(Interface::Value);
-        let accessible_id = optional(
+        let interface_set = optional(
             object,
             "Accessible",
-            "AccessibleId",
-            proxy.accessible_id().await,
-        )
-        .filter(|id| !id.is_empty());
+            "GetInterfaces",
+            proxy.get_interfaces().await,
+        );
         let children = proxy
             .get_children()
             .await
@@ -256,7 +249,10 @@ impl AtspiAdapter {
             .map(|child| object_id(&child))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let (actions, action_inspection_failed) = if interface_set.contains(Interface::Action) {
+        let actions = if interface_set
+            .as_ref()
+            .is_some_and(|interfaces| interfaces.contains(Interface::Action))
+        {
             match optional(
                 object,
                 "Action",
@@ -264,26 +260,28 @@ impl AtspiAdapter {
                 action_proxy(connection, object).await,
             ) {
                 Some(action) => {
-                    let actions = action.get_actions().await;
-                    let failed = actions.is_err();
-                    (
-                        optional(object, "Action", "GetActions", actions)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|action| ActionInfo {
-                                name: action.name,
-                                description: action.description,
-                            })
-                            .collect(),
-                        failed,
-                    )
+                    match optional(object, "Action", "GetActions", action.get_actions().await) {
+                        Some(actions) => ActionCapabilities::Inspected(
+                            actions
+                                .into_iter()
+                                .map(|action| ActionInfo {
+                                    name: action.name,
+                                    description: action.description,
+                                })
+                                .collect(),
+                        ),
+                        None => ActionCapabilities::InspectionFailed,
+                    }
                 }
-                None => (Vec::new(), true),
+                None => ActionCapabilities::InspectionFailed,
             }
         } else {
-            (Vec::new(), false)
+            ActionCapabilities::Unsupported
         };
-        let window_frame = if interface_set.contains(Interface::Component) {
+        let has_component = interface_set
+            .as_ref()
+            .is_some_and(|interfaces| interfaces.contains(Interface::Component));
+        let window_frame = if has_component {
             match optional(
                 object,
                 "Component",
@@ -302,32 +300,41 @@ impl AtspiAdapter {
         } else {
             None
         };
-        let (text, selected_text) = if interface_set.contains(Interface::Text) {
+        let (text, selected_text) = if interface_set
+            .as_ref()
+            .is_some_and(|interfaces| interfaces.contains(Interface::Text))
+        {
             read_text_metadata(connection, object, text_limit).await
         } else {
             (None, None)
         };
-        let value = if interface_set.contains(Interface::Value) {
+        let has_value = interface_set
+            .as_ref()
+            .is_some_and(|interfaces| interfaces.contains(Interface::Value));
+        let value = if has_value {
             read_value_metadata(connection, object).await
         } else {
             None
         };
 
+        let capabilities = match interface_set {
+            Some(interfaces) => NodeCapabilities::Inspected(InspectedCapabilities {
+                actions,
+                component: has_component,
+                editable_text: interfaces.contains(Interface::EditableText),
+                value: has_value,
+            }),
+            None => NodeCapabilities::InspectionFailed,
+        };
         Ok(NodeInfo {
             object: object.clone(),
-            accessible_id,
             role,
             name,
             value,
             text,
             selected_text,
             states,
-            actions,
-            editable_text,
-            value_interface,
-            interface_inspection_failed,
-            action_inspection_failed,
-            component_interface: interface_set.contains(Interface::Component),
+            capabilities,
             window_frame,
             children,
         })
@@ -379,20 +386,24 @@ impl AtspiAdapter {
 }
 
 impl AccessibilityAdapter for AtspiAdapter {
-    fn discover(&self) -> AdapterFuture<'_, Vec<AppInfo>> {
-        Box::pin(self.discover_inner())
+    fn discover(&self) -> impl Future<Output = Result<Vec<AppInfo>, RuntimeError>> + Send + '_ {
+        self.discover_inner()
     }
 
     fn read_node<'a>(
         &'a self,
         object: &'a ObjectId,
         text_limit: usize,
-    ) -> AdapterFuture<'a, NodeInfo> {
-        Box::pin(self.read_node_inner(object, text_limit))
+    ) -> impl Future<Output = Result<NodeInfo, RuntimeError>> + Send + 'a {
+        self.read_node_inner(object, text_limit)
     }
 
-    fn act<'a>(&'a self, object: &'a ObjectId, action: SemanticAction) -> AdapterFuture<'a, ()> {
-        Box::pin(self.act_inner(object, action))
+    fn act<'a>(
+        &'a self,
+        object: &'a ObjectId,
+        action: SemanticAction,
+    ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a {
+        self.act_inner(object, action)
     }
 }
 

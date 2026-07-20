@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     future::Future,
     os::fd::OwnedFd,
     pin::Pin,
@@ -42,22 +41,21 @@ pub struct CaptureTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedFrame {
-    pub stream_index: usize,
+    pub metadata: FrameMetadata,
+    pub rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMetadata {
     pub generation: u64,
     pub format_generation: u64,
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
+    pub size: (u32, u32),
     pub crop: PixelRect,
     pub transform: Transform,
 }
 
 pub trait CaptureBackend: Send + Sync + 'static {
-    fn start(
-        &self,
-        fd: OwnedFd,
-        targets: Vec<CaptureTarget>,
-    ) -> Result<Box<dyn CaptureSession>, String>;
+    fn start(&self, fd: OwnedFd, target: CaptureTarget) -> Result<Box<dyn CaptureSession>, String>;
 }
 
 pub type CaptureFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -67,7 +65,6 @@ pub trait CaptureSession: Send + 'static {
     fn failure(&self) -> Option<String>;
     fn latest_after(
         &mut self,
-        stream_index: usize,
         after_generation: Option<u64>,
         wait: Duration,
     ) -> CaptureFuture<'_, OwnedFrame>;
@@ -77,18 +74,13 @@ pub trait CaptureSession: Send + 'static {
 pub struct PipeWireCapture;
 
 impl CaptureBackend for PipeWireCapture {
-    fn start(
-        &self,
-        fd: OwnedFd,
-        targets: Vec<CaptureTarget>,
-    ) -> Result<Box<dyn CaptureSession>, String> {
-        CaptureHandle::spawn(fd, targets)
-            .map(|capture| Box::new(capture) as Box<dyn CaptureSession>)
+    fn start(&self, fd: OwnedFd, target: CaptureTarget) -> Result<Box<dyn CaptureSession>, String> {
+        CaptureHandle::spawn(fd, target).map(|capture| Box::new(capture) as Box<dyn CaptureSession>)
     }
 }
 
 pub struct CaptureHandle {
-    receivers: HashMap<usize, watch::Receiver<Option<OwnedFrame>>>,
+    receiver: watch::Receiver<Option<OwnedFrame>>,
     status: watch::Receiver<Option<Result<(), String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -99,29 +91,13 @@ impl std::fmt::Debug for CaptureHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CaptureHandle")
-            .field("streams", &self.receivers.keys())
             .finish_non_exhaustive()
     }
 }
 
 impl CaptureHandle {
-    fn spawn(fd: OwnedFd, targets: Vec<CaptureTarget>) -> Result<Self, String> {
-        if targets.is_empty() {
-            return Err("portal returned no PipeWire stream targets".into());
-        }
-        let mut receivers = HashMap::new();
-        let mut senders = HashMap::new();
-        for target in &targets {
-            if receivers.contains_key(&target.stream_index) {
-                return Err(format!(
-                    "duplicate capture stream index {}",
-                    target.stream_index
-                ));
-            }
-            let (sender, receiver) = watch::channel(None);
-            senders.insert(target.stream_index, sender);
-            receivers.insert(target.stream_index, receiver);
-        }
+    fn spawn(fd: OwnedFd, target: CaptureTarget) -> Result<Self, String> {
+        let (sender, receiver) = watch::channel(None);
         let (status_sender, status) = watch::channel(None);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -129,7 +105,7 @@ impl CaptureHandle {
         let thread = std::thread::Builder::new()
             .name("ocu-pipewire".into())
             .spawn(move || {
-                let result = run_pipewire(fd, targets, senders, &thread_stop);
+                let result = run_pipewire(fd, target, sender, &thread_stop);
                 if let Err(error) = &result {
                     eprintln!("open-computer-use: PipeWire capture stopped: {error}");
                 }
@@ -138,38 +114,38 @@ impl CaptureHandle {
             })
             .map_err(|error| format!("cannot start dedicated PipeWire thread: {error}"))?;
         Ok(Self {
-            receivers,
+            receiver,
             status,
             stop,
             thread: Some(thread),
             thread_done,
         })
     }
+}
 
-    pub async fn wait_ready(&mut self) -> Result<(), String> {
-        loop {
-            if let Some(status) = self.status.borrow().clone() {
-                return status;
-            }
-            if self
-                .receivers
-                .values()
-                .any(|receiver| receiver.borrow().is_some())
-            {
-                return Ok(());
-            }
-            tokio::select! {
-                changed = self.status.changed() => {
-                    if changed.is_err() {
-                        return Err("PipeWire status channel closed before startup".into());
-                    }
+impl CaptureSession for CaptureHandle {
+    fn wait_ready(&mut self) -> CaptureFuture<'_, ()> {
+        Box::pin(async move {
+            loop {
+                if let Some(status) = self.status.borrow().clone() {
+                    return status;
                 }
-                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                if self.receiver.borrow().is_some() {
+                    return Ok(());
+                }
+                tokio::select! {
+                    changed = self.status.changed() => {
+                        if changed.is_err() {
+                            return Err("PipeWire status channel closed before startup".into());
+                        }
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
             }
-        }
+        })
     }
 
-    pub fn failure(&self) -> Option<String> {
+    fn failure(&self) -> Option<String> {
         match self.status.borrow().as_ref() {
             Some(Err(error)) => Some(error.clone()),
             _ if self.status.has_changed().is_err() => {
@@ -179,63 +155,38 @@ impl CaptureHandle {
         }
     }
 
-    pub async fn latest_after(
-        &mut self,
-        stream_index: usize,
-        after_generation: Option<u64>,
-        wait: Duration,
-    ) -> Result<OwnedFrame, String> {
-        let (receivers, status) = (&mut self.receivers, &mut self.status);
-        let receiver = receivers
-            .get_mut(&stream_index)
-            .ok_or_else(|| format!("capture has no portal stream index {stream_index}"))?;
-        let future = async {
-            loop {
-                if let Some(Err(error)) = status.borrow().clone() {
-                    return Err(error);
-                }
-                if let Some(frame) = receiver.borrow().clone()
-                    && after_generation.is_none_or(|generation| frame.generation > generation)
-                {
-                    return Ok(frame);
-                }
-                tokio::select! {
-                    changed = receiver.changed() => {
-                        changed.map_err(|_| format!("PipeWire frame channel for stream {stream_index} closed"))?;
-                    }
-                    changed = status.changed() => {
-                        changed.map_err(|_| "PipeWire status channel closed during capture".to_owned())?;
-                    }
-                }
-            }
-        };
-        tokio::time::timeout(wait, future).await.map_err(|_| {
-            format!("timed out waiting for a complete frame on stream {stream_index}")
-        })?
-    }
-}
-
-impl CaptureSession for CaptureHandle {
-    fn wait_ready(&mut self) -> CaptureFuture<'_, ()> {
-        Box::pin(CaptureHandle::wait_ready(self))
-    }
-
-    fn failure(&self) -> Option<String> {
-        CaptureHandle::failure(self)
-    }
-
     fn latest_after(
         &mut self,
-        stream_index: usize,
         after_generation: Option<u64>,
         wait: Duration,
     ) -> CaptureFuture<'_, OwnedFrame> {
-        Box::pin(CaptureHandle::latest_after(
-            self,
-            stream_index,
-            after_generation,
-            wait,
-        ))
+        Box::pin(async move {
+            let (receiver, status) = (&mut self.receiver, &mut self.status);
+            let future = async {
+                loop {
+                    if let Some(Err(error)) = status.borrow().clone() {
+                        return Err(error);
+                    }
+                    if let Some(frame) = receiver.borrow().clone()
+                        && after_generation
+                            .is_none_or(|generation| frame.metadata.generation > generation)
+                    {
+                        return Ok(frame);
+                    }
+                    tokio::select! {
+                        changed = receiver.changed() => {
+                            changed.map_err(|_| "PipeWire frame channel closed".to_owned())?;
+                        }
+                        changed = status.changed() => {
+                            changed.map_err(|_| "PipeWire status channel closed during capture".to_owned())?;
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(wait, future)
+                .await
+                .map_err(|_| "timed out waiting for a complete frame".to_owned())?
+        })
     }
 }
 
@@ -281,8 +232,8 @@ struct RawFormat {
 
 fn run_pipewire(
     fd: OwnedFd,
-    targets: Vec<CaptureTarget>,
-    mut senders: HashMap<usize, watch::Sender<Option<OwnedFrame>>>,
+    target: CaptureTarget,
+    sender: watch::Sender<Option<OwnedFrame>>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     pw::init();
@@ -291,68 +242,63 @@ fn run_pipewire(
     let core = context
         .connect_fd_rc(fd, None)
         .map_err(|error| format!("cannot open the portal-restricted PipeWire remote: {error}"))?;
-    let mut runtimes = Vec::new();
     let failure = Arc::new(Mutex::new(None));
 
-    for target in targets {
-        let sender = senders
-            .remove(&target.stream_index)
-            .ok_or_else(|| "capture sender invariant failed".to_owned())?;
-        let mut props = properties! {
-            *pw::keys::MEDIA_TYPE => "Video",
-            *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::MEDIA_ROLE => "Screen",
-        };
-        if let Some(serial) = target.pipewire_serial {
-            props.insert(*pw::keys::TARGET_OBJECT, serial.to_string());
-        }
-        let stream = pw::stream::StreamBox::new(
-            &core,
-            &format!("open-computer-use-{}", target.stream_index),
-            props,
-        )
-        .map_err(pw_error)?;
-        let user_data = StreamUserData {
-            stream_index: target.stream_index,
-            generation: 0,
-            format_generation: 0,
-            format: None,
-            sender,
-            failure: Arc::clone(&failure),
-        };
-        let listener = stream
-            .add_local_listener_with_user_data(user_data)
-            .state_changed(|_, data, old, new| {
-                let error = stream_state_failure(data.stream_index, &old, &new);
-                if let Some(error) = error {
-                    report_failure(&data.failure, error);
-                }
-            })
-            .param_changed(|stream, data, id, param| {
-                if id != ParamType::Format.as_raw() {
-                    return;
-                }
-                let Some(param) = param else {
-                    invalidate_format(data);
-                    data.format = None;
-                    report_failure(
-                        &data.failure,
-                        format!(
-                            "PipeWire cleared the negotiated format for stream {}",
-                            data.stream_index
-                        ),
-                    );
-                    return;
-                };
-                match parse_raw_format(param) {
-                    Ok(format) => {
-                        if let Err(error) = begin_format(data) {
-                            report_failure(&data.failure, error);
-                            return;
-                        }
-                        match negotiated_parameter_pods(format)
-                            .and_then(|pods| update_stream_params(stream, &pods))
-                        {
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE => "Video",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Screen",
+    };
+    if let Some(serial) = target.pipewire_serial {
+        props.insert(*pw::keys::TARGET_OBJECT, serial.to_string());
+    }
+    let stream = pw::stream::StreamBox::new(
+        &core,
+        &format!("open-computer-use-{}", target.stream_index),
+        props,
+    )
+    .map_err(pw_error)?;
+    let user_data = StreamUserData {
+        stream_index: target.stream_index,
+        generation: 0,
+        format_generation: 0,
+        format: None,
+        sender,
+        failure: Arc::clone(&failure),
+    };
+    let listener = stream
+        .add_local_listener_with_user_data(user_data)
+        .state_changed(|_, data, old, new| {
+            let error = stream_state_failure(data.stream_index, &old, &new);
+            if let Some(error) = error {
+                report_failure(&data.failure, error);
+            }
+        })
+        .param_changed(|stream, data, id, param| {
+            if id != ParamType::Format.as_raw() {
+                return;
+            }
+            let Some(param) = param else {
+                invalidate_format(data);
+                data.format = None;
+                report_failure(
+                    &data.failure,
+                    format!(
+                        "PipeWire cleared the negotiated format for stream {}",
+                        data.stream_index
+                    ),
+                );
+                return;
+            };
+            match parse_raw_format(param) {
+                Ok(format) => {
+                    if let Err(error) = begin_format(data) {
+                        report_failure(&data.failure, error);
+                        return;
+                    }
+                    match negotiated_parameter_pods(format)
+                        .and_then(|pods| update_stream_params(stream, &pods))
+                    {
                         Ok(()) => data.format = Some(format),
                         Err(error) => {
                             invalidate_format(data);
@@ -364,38 +310,36 @@ fn run_pipewire(
                                 ),
                             );
                         }
-                        }
-                    }
-                    Err(error) => {
-                        invalidate_format(data);
-                        report_failure(
-                            &data.failure,
-                            format!(
-                                "rejecting PipeWire format for stream {}: {error}",
-                                data.stream_index
-                            ),
-                        );
                     }
                 }
-            })
-            .process(process_frame)
-            .register()
-            .map_err(pw_error)?;
+                Err(error) => {
+                    invalidate_format(data);
+                    report_failure(
+                        &data.failure,
+                        format!(
+                            "rejecting PipeWire format for stream {}: {error}",
+                            data.stream_index
+                        ),
+                    );
+                }
+            }
+        })
+        .process(process_frame)
+        .register()
+        .map_err(pw_error)?;
 
-        let format_pod = raw_format_pod()?;
-        let mut params = [Pod::from_bytes(&format_pod)
-            .ok_or_else(|| "generated an invalid PipeWire format pod".to_owned())?];
-        let node = target.pipewire_serial.is_none().then_some(target.node_id);
-        stream
-            .connect(
-                Direction::Input,
-                node,
-                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-                &mut params,
-            )
-            .map_err(pw_error)?;
-        runtimes.push((stream, listener));
-    }
+    let format_pod = raw_format_pod()?;
+    let mut params = [Pod::from_bytes(&format_pod)
+        .ok_or_else(|| "generated an invalid PipeWire format pod".to_owned())?];
+    let node = target.pipewire_serial.is_none().then_some(target.node_id);
+    stream
+        .connect(
+            Direction::Input,
+            node,
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )
+        .map_err(pw_error)?;
 
     while !stop.load(Ordering::Acquire) {
         let dispatched = main_loop
@@ -408,11 +352,10 @@ fn run_pipewire(
             return Err(error);
         }
     }
-    for (stream, _) in &runtimes {
-        if let Err(error) = stream.disconnect() {
-            eprintln!("open-computer-use: failed to disconnect PipeWire stream: {error}");
-        }
+    if let Err(error) = stream.disconnect() {
+        eprintln!("open-computer-use: failed to disconnect PipeWire stream: {error}");
     }
+    drop(listener);
     Ok(())
 }
 
@@ -755,14 +698,14 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
         }
     };
     user_data.sender.send_replace(Some(OwnedFrame {
-        stream_index: user_data.stream_index,
-        generation: user_data.generation,
-        format_generation: user_data.format_generation,
-        width: format.width,
-        height: format.height,
+        metadata: FrameMetadata {
+            generation: user_data.generation,
+            format_generation: user_data.format_generation,
+            size: (format.width, format.height),
+            crop,
+            transform,
+        },
         rgba,
-        crop,
-        transform,
     }));
 }
 
@@ -794,11 +737,7 @@ fn optional_crop(meta: Option<&MetaVideoCrop>, format: RawFormat) -> Result<Pixe
         width: size.width,
         height: size.height,
     };
-    if crop.width == 0
-        || crop.height == 0
-        || crop.right().is_none_or(|right| right > format.width)
-        || crop.bottom().is_none_or(|bottom| bottom > format.height)
-    {
+    if !crop.is_valid_within((format.width, format.height)) {
         return Err("region lies outside the negotiated frame".into());
     }
     Ok(crop)
@@ -1152,13 +1091,31 @@ mod tests {
         );
     }
 
+    fn frame(generation: u64, format_generation: u64, size: (u32, u32), value: u8) -> OwnedFrame {
+        OwnedFrame {
+            metadata: FrameMetadata {
+                generation,
+                format_generation,
+                size,
+                crop: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: size.0,
+                    height: size.1,
+                },
+                transform: Transform::Normal,
+            },
+            rgba: vec![value; (size.0 * size.1 * 4) as usize],
+        }
+    }
+
     #[tokio::test]
     async fn handle_failure_interrupts_frame_wait() {
         let (_frame_sender, frame_receiver) = watch::channel(None);
         let (status_sender, status) = watch::channel(None);
         let (_done_sender, thread_done) = std::sync::mpsc::channel();
         let mut handle = CaptureHandle {
-            receivers: HashMap::from([(0, frame_receiver)]),
+            receiver: frame_receiver,
             status,
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
@@ -1166,7 +1123,7 @@ mod tests {
         };
         status_sender.send_replace(Some(Err("node disappeared".into())));
         let error = handle
-            .latest_after(0, None, Duration::from_secs(1))
+            .latest_after(None, Duration::from_secs(1))
             .await
             .unwrap_err();
         assert_eq!(error, "node disappeared");
@@ -1177,42 +1134,14 @@ mod tests {
     fn watch_channel_keeps_only_the_newest_complete_frame() {
         let (sender, receiver) = watch::channel(None);
         for generation in 1..=100 {
-            sender.send_replace(Some(OwnedFrame {
-                stream_index: 0,
-                generation,
-                format_generation: 1,
-                width: 1,
-                height: 1,
-                rgba: vec![0; 4],
-                crop: PixelRect {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                },
-                transform: Transform::Normal,
-            }));
+            sender.send_replace(Some(frame(generation, 1, (1, 1), 0)));
         }
-        assert_eq!(receiver.borrow().as_ref().unwrap().generation, 100);
+        assert_eq!(receiver.borrow().as_ref().unwrap().metadata.generation, 100);
     }
 
     #[tokio::test]
     async fn renegotiation_clears_old_frame_until_current_format_frame_arrives() {
-        let (sender, receiver) = watch::channel(Some(OwnedFrame {
-            stream_index: 0,
-            generation: 1,
-            format_generation: 1,
-            width: 1,
-            height: 1,
-            rgba: vec![1; 4],
-            crop: PixelRect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            },
-            transform: Transform::Normal,
-        }));
+        let (sender, receiver) = watch::channel(Some(frame(1, 1, (1, 1), 1)));
         let failure = Arc::new(Mutex::new(None));
         let mut data = StreamUserData {
             stream_index: 0,
@@ -1233,7 +1162,7 @@ mod tests {
         let (_status_sender, status) = watch::channel(None);
         let (_done_sender, thread_done) = std::sync::mpsc::channel();
         let mut handle = CaptureHandle {
-            receivers: HashMap::from([(0, receiver)]),
+            receiver,
             status,
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
@@ -1241,28 +1170,17 @@ mod tests {
         };
         let producer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            sender.send_replace(Some(OwnedFrame {
-                stream_index: 0,
-                generation: 2,
-                format_generation: 2,
-                width: 2,
-                height: 1,
-                rgba: vec![2; 8],
-                crop: PixelRect {
-                    x: 0,
-                    y: 0,
-                    width: 2,
-                    height: 1,
-                },
-                transform: Transform::Normal,
-            }));
+            sender.send_replace(Some(frame(2, 2, (2, 1), 2)));
         });
         let frame = handle
-            .latest_after(0, None, Duration::from_secs(1))
+            .latest_after(None, Duration::from_secs(1))
             .await
             .unwrap();
         producer.await.unwrap();
-        assert_eq!((frame.generation, frame.format_generation), (2, 2));
+        assert_eq!(
+            (frame.metadata.generation, frame.metadata.format_generation),
+            (2, 2)
+        );
         assert_eq!(frame.rgba, vec![2; 8]);
     }
 
@@ -1273,21 +1191,7 @@ mod tests {
             width: 1,
             height: 1,
         };
-        let (sender, receiver) = watch::channel(Some(OwnedFrame {
-            stream_index: 0,
-            generation: 1,
-            format_generation: 1,
-            width: 1,
-            height: 1,
-            rgba: vec![1; 4],
-            crop: PixelRect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            },
-            transform: Transform::Normal,
-        }));
+        let (sender, receiver) = watch::channel(Some(frame(1, 1, (1, 1), 1)));
         let mut data = StreamUserData {
             stream_index: 0,
             generation: 1,

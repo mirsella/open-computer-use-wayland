@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     future::Future,
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,18 +13,13 @@ use tokio::time::{sleep, timeout};
 
 use crate::{
     errors::{RuntimeError, ToolOutcome},
-    input::{GeneratedInputAction, GeneratedInputProvider},
-    runtime::{DesktopRuntime, RuntimeFuture, ToolOutput},
+    input::GeneratedInputAction,
+    runtime::{DesktopRuntime, ToolOutput},
     screenshot::{NoScreenshots, ScreenshotMapping, ScreenshotProvider},
-    validation::{
-        ApplicationScope, ElementAction, KeyboardAction, MAX_TEXT_LIMIT, PointerAction, TextLimit,
-        ToolCall,
-    },
+    validation::{ApplicationScope, ElementAction, MAX_TEXT_LIMIT, TextLimit, ToolCall},
 };
 
 pub const EMPTY_APPS_MESSAGE: &str = "No running applications with accessible windows found.";
-
-pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, RuntimeError>> + Send + 'a>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId {
@@ -69,21 +63,103 @@ pub struct AppInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ActionCapabilities {
+    Unsupported,
+    InspectionFailed,
+    Inspected(Vec<ActionInfo>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InspectedCapabilities {
+    pub actions: ActionCapabilities,
+    pub component: bool,
+    pub editable_text: bool,
+    pub value: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeCapabilities {
+    InspectionFailed,
+    Inspected(InspectedCapabilities),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetValueKind {
+    Text,
+    Number,
+}
+
+impl NodeCapabilities {
+    fn actions(&self) -> &[ActionInfo] {
+        match self {
+            Self::Inspected(InspectedCapabilities {
+                actions: ActionCapabilities::Inspected(actions),
+                ..
+            }) => actions,
+            _ => &[],
+        }
+    }
+
+    fn inspected_actions(&self) -> Result<&[ActionInfo], ()> {
+        match self {
+            Self::InspectionFailed
+            | Self::Inspected(InspectedCapabilities {
+                actions: ActionCapabilities::InspectionFailed,
+                ..
+            }) => Err(()),
+            Self::Inspected(InspectedCapabilities {
+                actions: ActionCapabilities::Unsupported,
+                ..
+            }) => Ok(&[]),
+            Self::Inspected(InspectedCapabilities {
+                actions: ActionCapabilities::Inspected(actions),
+                ..
+            }) => Ok(actions),
+        }
+    }
+
+    fn inspection_complete(&self) -> bool {
+        self.inspected_actions().is_ok()
+    }
+
+    fn supports_focus(&self) -> bool {
+        matches!(
+            self,
+            Self::Inspected(InspectedCapabilities {
+                component: true,
+                ..
+            })
+        )
+    }
+
+    fn set_value_kind(&self) -> Option<SetValueKind> {
+        match self {
+            Self::Inspected(InspectedCapabilities {
+                editable_text: true,
+                ..
+            }) => Some(SetValueKind::Text),
+            Self::Inspected(InspectedCapabilities { value: true, .. }) => {
+                Some(SetValueKind::Number)
+            }
+            _ => None,
+        }
+    }
+
+    fn interfaces_inspected(&self) -> bool {
+        matches!(self, Self::Inspected(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeInfo {
     pub object: ObjectId,
-    pub accessible_id: Option<String>,
     pub role: String,
     pub name: String,
     pub value: Option<String>,
     pub text: Option<String>,
     pub selected_text: Option<String>,
     pub states: BTreeSet<String>,
-    pub actions: Vec<ActionInfo>,
-    pub editable_text: bool,
-    pub value_interface: bool,
-    pub interface_inspection_failed: bool,
-    pub action_inspection_failed: bool,
-    pub component_interface: bool,
+    pub capabilities: NodeCapabilities,
     pub window_frame: Option<Rect>,
     pub children: Vec<ObjectId>,
 }
@@ -103,13 +179,17 @@ pub enum SemanticAction {
 }
 
 pub trait AccessibilityAdapter: Send + Sync + 'static {
-    fn discover(&self) -> AdapterFuture<'_, Vec<AppInfo>>;
+    fn discover(&self) -> impl Future<Output = Result<Vec<AppInfo>, RuntimeError>> + Send + '_;
     fn read_node<'a>(
         &'a self,
         object: &'a ObjectId,
         text_limit: usize,
-    ) -> AdapterFuture<'a, NodeInfo>;
-    fn act<'a>(&'a self, object: &'a ObjectId, action: SemanticAction) -> AdapterFuture<'a, ()>;
+    ) -> impl Future<Output = Result<NodeInfo, RuntimeError>> + Send + 'a;
+    fn act<'a>(
+        &'a self,
+        object: &'a ObjectId,
+        action: SemanticAction,
+    ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,9 +220,14 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElementSnapshot {
     pub depth: usize,
-    pub tree_path: Vec<usize>,
     pub node: NodeInfo,
-    pub frame: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotLimits {
+    pub text: usize,
+    pub nodes: usize,
+    pub depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,16 +239,19 @@ pub struct Snapshot {
     pub elements: Vec<ElementSnapshot>,
     pub node_limit_reached: bool,
     pub depth_limit_reached: bool,
-    pub text_limit: usize,
-    pub max_nodes: usize,
-    pub max_depth: usize,
-    pub screenshot_mapping: Option<ScreenshotMapping>,
+    pub limits: SnapshotLimits,
+}
+
+#[derive(Debug)]
+struct CachedObservation {
+    snapshot: Arc<Snapshot>,
+    screenshot_mapping: Option<ScreenshotMapping>,
 }
 
 #[derive(Debug, Default)]
 struct Cache {
     generation: u64,
-    current: Option<Snapshot>,
+    current: Option<CachedObservation>,
 }
 
 pub struct SemanticRuntime<A, S = NoScreenshots> {
@@ -194,9 +282,7 @@ impl<A: AccessibilityAdapter> SemanticRuntime<A, NoScreenshots> {
     }
 }
 
-impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
-    SemanticRuntime<A, S>
-{
+impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     pub fn with_screenshot_provider(adapter: A, screenshots: S, config: RuntimeConfig) -> Self {
         Self {
             adapter,
@@ -297,58 +383,20 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
                 element_id,
                 action,
             } => {
-                let operation = match action {
-                    ElementAction::Invoke => ElementOperation::Invoke,
-                    ElementAction::Named(name) => ElementOperation::Named(name),
-                    ElementAction::Focus => ElementOperation::Focus,
-                    ElementAction::SetValue(value) => ElementOperation::SetValue(value),
-                };
-                let snapshot = self
-                    .element_action(&state_id, &element_id, operation)
-                    .await?;
+                let snapshot = self.element_action(&state_id, &element_id, action).await?;
                 Ok(self.observe(snapshot).await)
             }
             ToolCall::Pointer { state_id, action } => {
-                let action = match action {
-                    PointerAction::Move { x, y } => GeneratedInputAction::MovePointer { x, y },
-                    PointerAction::Click {
-                        x,
-                        y,
-                        button,
-                        count,
-                    } => GeneratedInputAction::Click {
-                        x,
-                        y,
-                        button,
-                        count,
-                    },
-                    PointerAction::Drag { from, to } => GeneratedInputAction::Drag { from, to },
-                    PointerAction::Scroll {
-                        x,
-                        y,
-                        delta_x,
-                        delta_y,
-                    } => GeneratedInputAction::Scroll {
-                        x,
-                        y,
-                        delta_x,
-                        delta_y,
-                    },
-                };
-                let cached = self.prepare_generated(&state_id).await?;
-                self.perform_generated(cached, action).await
+                self.perform_generated(&state_id, GeneratedInputAction::Pointer(action))
+                    .await
             }
             ToolCall::Keyboard {
                 state_id,
                 focus,
                 action,
             } => {
-                let action = match action {
-                    KeyboardAction::Press(key) => GeneratedInputAction::PressKey { focus, key },
-                    KeyboardAction::Type(text) => GeneratedInputAction::TypeText { focus, text },
-                };
-                let cached = self.prepare_generated(&state_id).await?;
-                self.perform_generated(cached, action).await
+                self.perform_generated(&state_id, GeneratedInputAction::Keyboard { focus, action })
+                    .await
             }
         }
     }
@@ -412,26 +460,27 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
     async fn snapshot_and_cache(
         &self,
         app_query: String,
-        text_limit: usize,
-        max_nodes: usize,
-        max_depth: usize,
-    ) -> Result<Snapshot, RuntimeError> {
-        let future =
-            self.collect_snapshot(app_query.clone(), None, text_limit, max_nodes, max_depth);
+        limits: SnapshotLimits,
+    ) -> Result<Arc<Snapshot>, RuntimeError> {
+        let future = self.collect_snapshot(app_query.clone(), None, limits);
         let snapshot = timeout(self.config.snapshot_timeout, future)
             .await
             .map_err(|_| operational_error("AT-SPI snapshot timed out"))??;
         self.commit_snapshot(snapshot)
     }
 
-    fn commit_snapshot(&self, mut snapshot: Snapshot) -> Result<Snapshot, RuntimeError> {
+    fn commit_snapshot(&self, mut snapshot: Snapshot) -> Result<Arc<Snapshot>, RuntimeError> {
         let mut cache = self.lock_cache()?;
         cache.generation = cache
             .generation
             .checked_add(1)
             .ok_or_else(|| operational_error("snapshot generation overflow"))?;
         snapshot.generation = cache.generation;
-        cache.current = Some(snapshot.clone());
+        let snapshot = Arc::new(snapshot);
+        cache.current = Some(CachedObservation {
+            snapshot: Arc::clone(&snapshot),
+            screenshot_mapping: None,
+        });
         Ok(snapshot)
     }
 
@@ -439,9 +488,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         &self,
         app_query: String,
         expected_pid: Option<u32>,
-        text_limit: usize,
-        max_nodes: usize,
-        max_depth: usize,
+        limits: SnapshotLimits,
     ) -> Result<Snapshot, RuntimeError> {
         let apps = self.discover().await?;
         let resolved = resolve_app(&app_query, expected_pid, &apps)?;
@@ -456,9 +503,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         } else {
             choose_window(&resolved.app.windows)?.clone()
         };
-        let elements = self
-            .traverse(&window, text_limit, max_nodes, max_depth)
-            .await?;
+        let elements = self.traverse(&window, limits).await?;
         Ok(Snapshot {
             app_query,
             app: resolved.app,
@@ -467,34 +512,29 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
             node_limit_reached: elements.node_limit_reached,
             depth_limit_reached: elements.depth_limit_reached,
             elements: elements.elements,
-            text_limit,
-            max_nodes,
-            max_depth,
-            screenshot_mapping: None,
+            limits,
         })
     }
 
     async fn traverse(
         &self,
         window: &WindowInfo,
-        text_limit: usize,
-        max_nodes: usize,
-        max_depth: usize,
+        limits: SnapshotLimits,
     ) -> Result<Traversal, RuntimeError> {
-        let mut stack = vec![(window.object.clone(), 0_usize, Vec::new())];
+        let mut stack = vec![(window.object.clone(), 0_usize)];
         let mut elements = Vec::new();
         let mut node_limit_reached = false;
         let mut depth_limit_reached = false;
-        while let Some((object, depth, path)) = stack.pop() {
-            if elements.len() >= max_nodes {
+        while let Some((object, depth)) = stack.pop() {
+            if elements.len() >= limits.nodes {
                 node_limit_reached = true;
                 break;
             }
-            let node = match self.read_node(&object, text_limit).await {
+            let mut node = match self.read_node(&object, limits.text).await {
                 Ok(node) => node,
                 Err(error) if depth > 0 => {
                     eprintln!(
-                        "open-computer-use: skipping stale AT-SPI child: object={}{} path={path:?} error={error}",
+                        "open-computer-use: skipping stale AT-SPI child: object={}{} error={error}",
                         object.bus_name, object.path
                     );
                     continue;
@@ -515,29 +555,22 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
                     )));
                 }
                 eprintln!(
-                    "open-computer-use: skipping defunct AT-SPI child: object={}{} path={path:?}",
+                    "open-computer-use: skipping defunct AT-SPI child: object={}{}",
                     object.bus_name, object.path
                 );
                 continue;
             }
-            let frame = normalize_frame(&node);
+            node.window_frame = normalize_frame(&node);
             let children = node.children.clone();
-            elements.push(ElementSnapshot {
-                depth,
-                tree_path: path.clone(),
-                node,
-                frame,
-            });
-            if depth >= max_depth {
+            elements.push(ElementSnapshot { depth, node });
+            if depth >= limits.depth {
                 if !children.is_empty() {
                     depth_limit_reached = true;
                 }
                 continue;
             }
-            for (child_index, child) in children.into_iter().enumerate().rev() {
-                let mut child_path = path.clone();
-                child_path.push(child_index);
-                stack.push((child, depth + 1, child_path));
+            for child in children.into_iter().rev() {
+                stack.push((child, depth + 1));
             }
         }
         Ok(Traversal {
@@ -551,12 +584,12 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         &self,
         state_id: &str,
         index: &str,
-        operation: ElementOperation,
-    ) -> Result<Snapshot, RuntimeError> {
+        action: ElementAction,
+    ) -> Result<Arc<Snapshot>, RuntimeError> {
         let cached = self.required_cached(state_id)?;
-        let (_, old_element) = cached_element(&cached, index)?;
+        let old_element = cached_element(&cached, index)?;
         match self
-            .read_node(&old_element.node.object, cached.text_limit)
+            .read_node(&old_element.node.object, cached.limits.text)
             .await
         {
             Ok(node) if node.is_defunct() => {
@@ -574,26 +607,30 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         if target.node.is_defunct() {
             return Err(operational_error("target element is defunct"));
         }
-        let semantic = operation.to_semantic(target)?;
+        let semantic = semantic_action(action, target)?;
         self.require_latest_generation(&cached)?;
         self.invalidate_current(&cached)?;
-        self.run_action(&target.node.object, semantic)
-            .await
-            .map_err(uncertain_action)?;
+        timeout(
+            self.config.call_timeout,
+            self.adapter.act(&target.node.object, semantic),
+        )
+        .await
+        .map_err(|_| operational_error("AT-SPI semantic action timed out"))
+        .and_then(|result| result)
+        .map_err(uncertain_action)?;
         self.settle_and_refresh(cached)
             .await
             .map_err(completed_without_observation)
     }
 
     async fn fresh_for_action(&self, cached: &Snapshot) -> Result<Snapshot, RuntimeError> {
+        let limits = SnapshotLimits {
+            text: cached.limits.text,
+            nodes: self.config.default_max_nodes.max(cached.elements.len()),
+            depth: self.config.default_max_depth,
+        };
         let current = self
-            .collect_snapshot(
-                cached.app_query.clone(),
-                Some(cached.app.pid),
-                cached.text_limit,
-                self.config.default_max_nodes.max(cached.elements.len()),
-                self.config.default_max_depth,
-            )
+            .collect_snapshot(cached.app_query.clone(), Some(cached.app.pid), limits)
             .await?;
         if current.app.pid != cached.app.pid {
             return Err(operational_error(format!(
@@ -614,13 +651,35 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         Ok(current)
     }
 
-    async fn prepare_generated(&self, state_id: &str) -> Result<Snapshot, RuntimeError> {
-        let cached = self.required_cached(state_id)?;
-        if cached.screenshot_mapping.is_none() {
-            return Err(state_required_error(
-                "the observation has no usable screenshot; call observe and require screenshot.ready=true",
-            ));
-        }
+    async fn requested_snapshot(
+        &self,
+        app_query: String,
+        text_limit: Option<TextLimit>,
+        max_nodes: Option<usize>,
+        max_depth: Option<usize>,
+    ) -> Result<Arc<Snapshot>, RuntimeError> {
+        let text = match text_limit {
+            Some(TextLimit::Count(limit)) => limit,
+            Some(TextLimit::Max) => MAX_TEXT_LIMIT,
+            None => self.config.default_text_limit,
+        };
+        self.snapshot_and_cache(
+            app_query,
+            SnapshotLimits {
+                text,
+                nodes: max_nodes.unwrap_or(self.config.default_max_nodes),
+                depth: max_depth.unwrap_or(self.config.default_max_depth),
+            },
+        )
+        .await
+    }
+
+    async fn perform_generated(
+        &self,
+        state_id: &str,
+        action: GeneratedInputAction,
+    ) -> Result<ToolOutput, RuntimeError> {
+        let (cached, mapping) = self.required_screenshot(state_id)?;
         let preparation = timeout(self.config.portal_timeout, self.screenshots.prepare())
             .await
             .map_err(|_| operational_error("portal setup timed out before generated input"))?
@@ -632,43 +691,10 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
             ));
         }
         self.fresh_for_action(&cached).await?;
-        Ok(cached)
-    }
-
-    async fn requested_snapshot(
-        &self,
-        app_query: String,
-        text_limit: Option<TextLimit>,
-        max_nodes: Option<usize>,
-        max_depth: Option<usize>,
-    ) -> Result<Snapshot, RuntimeError> {
-        let text_limit = match text_limit {
-            Some(TextLimit::Count(limit)) => limit,
-            Some(TextLimit::Max) => MAX_TEXT_LIMIT,
-            None => self.config.default_text_limit,
-        };
-        self.snapshot_and_cache(
-            app_query,
-            text_limit,
-            max_nodes.unwrap_or(self.config.default_max_nodes),
-            max_depth.unwrap_or(self.config.default_max_depth),
-        )
-        .await
-    }
-
-    async fn perform_generated(
-        &self,
-        cached: Snapshot,
-        action: GeneratedInputAction,
-    ) -> Result<ToolOutput, RuntimeError> {
-        let mapping = cached
-            .screenshot_mapping
-            .as_ref()
-            .ok_or_else(|| operational_error("latest state has no safe screenshot mapping"))?;
         self.require_latest_generation(&cached)?;
         let preparation = timeout(
             self.config.snapshot_timeout,
-            self.screenshots.prepare_input(&cached, mapping, &action),
+            self.screenshots.prepare_input(&cached, &mapping, &action),
         )
         .await;
         let cleanup = self.screenshots.cleanup_input().await;
@@ -696,7 +722,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         self.invalidate_current(&cached)?;
         let result = timeout(
             self.config.snapshot_timeout,
-            self.screenshots.perform_input(&cached, mapping, action),
+            self.screenshots.perform_input(&cached, &mapping, action),
         )
         .await;
         let cleanup = self.screenshots.cleanup_input().await;
@@ -730,25 +756,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         Ok(self.observe(refreshed).await)
     }
 
-    async fn run_action(
-        &self,
-        object: &ObjectId,
-        action: SemanticAction,
-    ) -> Result<(), RuntimeError> {
-        timeout(self.config.call_timeout, self.adapter.act(object, action))
-            .await
-            .map_err(|_| operational_error("AT-SPI semantic action timed out"))?
-    }
-
-    async fn settle_and_refresh(&self, old: Snapshot) -> Result<Snapshot, RuntimeError> {
+    async fn settle_and_refresh(&self, old: Arc<Snapshot>) -> Result<Arc<Snapshot>, RuntimeError> {
         sleep(self.config.settle_interval).await;
-        let future = self.collect_snapshot(
-            old.app_query.clone(),
-            Some(old.app.pid),
-            old.text_limit,
-            old.max_nodes,
-            old.max_depth,
-        );
+        let future = self.collect_snapshot(old.app_query.clone(), Some(old.app.pid), old.limits);
         let refreshed = timeout(self.config.snapshot_timeout, future)
             .await
             .map_err(|_| operational_error("AT-SPI snapshot timed out after action"))??;
@@ -769,14 +779,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         let current = cache.current.as_mut().ok_or_else(|| {
             state_required_error("state cache lost the observation before generated input")
         })?;
-        if current.generation != expected.generation
-            || current.app.pid != expected.app.pid
-            || current.app.object != expected.app.object
-            || current.window.object != expected.window.object
+        if current.snapshot.generation != expected.generation
+            || current.snapshot.app.pid != expected.app.pid
+            || current.snapshot.app.object != expected.app.object
+            || current.snapshot.window.object != expected.window.object
         {
             return Err(stale_state_error(format!(
                 "stale mutation plan: expected generation {}, latest generation {}",
-                expected.generation, current.generation
+                expected.generation, current.snapshot.generation
             )));
         }
         if current.screenshot_mapping.take().is_none() {
@@ -787,7 +797,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         Ok(())
     }
 
-    async fn observe(&self, mut snapshot: Snapshot) -> ToolOutput {
+    async fn observe(&self, mut snapshot: Arc<Snapshot>) -> ToolOutput {
         let preparation = match timeout(self.config.portal_timeout, self.screenshots.prepare())
             .await
         {
@@ -812,12 +822,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         };
         if preparation.consent_interrupted_observation {
             snapshot = match self
-                .snapshot_and_cache(
-                    snapshot.app_query.clone(),
-                    snapshot.text_limit,
-                    snapshot.max_nodes,
-                    snapshot.max_depth,
-                )
+                .snapshot_and_cache(snapshot.app_query.clone(), snapshot.limits)
                 .await
             {
                 Ok(refreshed) => refreshed,
@@ -871,7 +876,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
                     );
                     return screenshot_unavailable(&snapshot, &error.to_string());
                 }
-                let (width, height) = observation.mapping.output_png_size;
+                let (width, height) = observation.mapping.output.size;
                 observation_output(
                     &snapshot,
                     true,
@@ -933,14 +938,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         let cached = cache.current.as_mut().ok_or_else(|| {
             state_required_error("state cache lost the observation during screenshot capture")
         })?;
-        if cached.generation != snapshot.generation
-            || cached.app.pid != snapshot.app.pid
-            || cached.app.object != mapping.app_identity
-            || cached.window.object != snapshot.window.object
+        if cached.snapshot.generation != snapshot.generation
+            || cached.snapshot.app.pid != snapshot.app.pid
+            || cached.snapshot.app.object != snapshot.app.object
+            || cached.snapshot.window.object != snapshot.window.object
         {
             eprintln!(
                 "open-computer-use: refusing stale screenshot cache write: cached_generation={} captured_generation={}",
-                cached.generation, snapshot.generation
+                cached.snapshot.generation, snapshot.generation
             );
             return Err(stale_state_error(
                 "state generation changed during screenshot capture",
@@ -954,33 +959,55 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         &self,
         state_id: &str,
     ) -> Result<Option<ScreenshotMapping>, RuntimeError> {
-        Ok(self
-            .cached(state_id)?
-            .and_then(|snapshot| snapshot.screenshot_mapping))
+        let cache = self.lock_cache()?;
+        Ok(cache.current.as_ref().and_then(|current| {
+            (snapshot_state_id(&current.snapshot) == state_id)
+                .then(|| current.screenshot_mapping.clone())
+                .flatten()
+        }))
     }
 
-    fn cached(&self, state_id: &str) -> Result<Option<Snapshot>, RuntimeError> {
-        let current = self.lock_cache()?.current.clone();
-        Ok(current.filter(|snapshot| snapshot_state_id(snapshot) == state_id))
-    }
-
-    fn required_cached(&self, state_id: &str) -> Result<Snapshot, RuntimeError> {
-        let current = self.lock_cache()?.current.clone().ok_or_else(|| {
+    fn required_cached(&self, state_id: &str) -> Result<Arc<Snapshot>, RuntimeError> {
+        let cache = self.lock_cache()?;
+        let current = cache.current.as_ref().ok_or_else(|| {
             state_required_error("no observation is available; call observe first")
         })?;
-        if snapshot_state_id(&current) != state_id {
+        if snapshot_state_id(&current.snapshot) != state_id {
             return Err(stale_state_error(format!(
                 "state_id {state_id:?} is stale; current state_id is {:?}",
-                snapshot_state_id(&current)
+                snapshot_state_id(&current.snapshot)
             )));
         }
-        Ok(current)
+        Ok(Arc::clone(&current.snapshot))
+    }
+
+    fn required_screenshot(
+        &self,
+        state_id: &str,
+    ) -> Result<(Arc<Snapshot>, ScreenshotMapping), RuntimeError> {
+        let cache = self.lock_cache()?;
+        let current = cache.current.as_ref().ok_or_else(|| {
+            state_required_error("no observation is available; call observe first")
+        })?;
+        if snapshot_state_id(&current.snapshot) != state_id {
+            return Err(stale_state_error(format!(
+                "state_id {state_id:?} is stale; current state_id is {:?}",
+                snapshot_state_id(&current.snapshot)
+            )));
+        }
+        let mapping = current.screenshot_mapping.clone().ok_or_else(|| {
+            state_required_error(
+                "the observation has no usable screenshot; call observe and require screenshot.ready=true",
+            )
+        })?;
+        Ok((Arc::clone(&current.snapshot), mapping))
     }
 
     fn require_latest_generation(&self, expected: &Snapshot) -> Result<(), RuntimeError> {
         let latest = self.required_cached(&snapshot_state_id(expected))?;
         if latest.generation != expected.generation
             || latest.app.pid != expected.app.pid
+            || latest.app.object != expected.app.object
             || latest.window.object != expected.window.object
         {
             return Err(stale_state_error(format!(
@@ -996,10 +1023,10 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
         let current = cache.current.as_ref().ok_or_else(|| {
             state_required_error("state cache lost the observation before action dispatch")
         })?;
-        if current.generation != expected.generation
-            || current.app.pid != expected.app.pid
-            || current.app.object != expected.app.object
-            || current.window.object != expected.window.object
+        if current.snapshot.generation != expected.generation
+            || current.snapshot.app.pid != expected.app.pid
+            || current.snapshot.app.object != expected.app.object
+            || current.snapshot.window.object != expected.window.object
         {
             return Err(stale_state_error(
                 "state changed before action dispatch; call observe again",
@@ -1017,32 +1044,29 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider>
     }
 }
 
-impl<A: AccessibilityAdapter, S: ScreenshotProvider + GeneratedInputProvider> DesktopRuntime
-    for SemanticRuntime<A, S>
-{
-    fn execute(&self, call: ToolCall) -> RuntimeFuture<'_> {
-        Box::pin(self.execute_call(call))
+impl<A: AccessibilityAdapter, S: ScreenshotProvider> DesktopRuntime for SemanticRuntime<A, S> {
+    fn execute(
+        &self,
+        call: ToolCall,
+    ) -> impl Future<Output = Result<ToolOutput, RuntimeError>> + Send + '_ {
+        self.execute_call(call)
     }
 
-    fn cleanup(&self) -> RuntimeFuture<'_, ()> {
-        Box::pin(async move {
-            let _mutation = self.mutation.lock().await;
-            self.screenshots
-                .cleanup_input()
-                .await
-                .map_err(operational_error)?;
-            Ok(())
-        })
+    async fn cleanup(&self) -> Result<(), RuntimeError> {
+        let _mutation = self.mutation.lock().await;
+        self.screenshots
+            .cleanup_input()
+            .await
+            .map_err(operational_error)?;
+        Ok(())
     }
 
-    fn shutdown(&self) -> RuntimeFuture<'_, ()> {
-        Box::pin(async move {
-            let _mutation = self.mutation.lock().await;
-            self.screenshots
-                .shutdown_input()
-                .await
-                .map_err(operational_error)
-        })
+    async fn shutdown(&self) -> Result<(), RuntimeError> {
+        let _mutation = self.mutation.lock().await;
+        self.screenshots
+            .shutdown_input()
+            .await
+            .map_err(operational_error)
     }
 }
 
@@ -1154,26 +1178,18 @@ fn ambiguous(query: &str, tier: &str, count: usize) -> RuntimeError {
 }
 
 fn choose_window(windows: &[WindowInfo]) -> Result<&WindowInfo, RuntimeError> {
-    let viable: Vec<_> = windows
+    windows
         .iter()
         .filter(|window| window_is_viable(window))
-        .collect();
-    if viable.is_empty() {
-        return Err(operational_error(
-            "application has no viable top-level window",
-        ));
-    }
-    Ok(viable
-        .iter()
-        .copied()
         .find(|window| window.states.contains("active"))
         .or_else(|| {
-            viable
+            windows
                 .iter()
-                .copied()
+                .filter(|window| window_is_viable(window))
                 .find(|window| window.states.contains("showing"))
         })
-        .unwrap_or(viable[0]))
+        .or_else(|| windows.iter().find(|window| window_is_viable(window)))
+        .ok_or_else(|| operational_error("application has no viable top-level window"))
 }
 
 fn window_is_viable(window: &WindowInfo) -> bool {
@@ -1188,20 +1204,18 @@ fn relocate<'a>(
     old: &ElementSnapshot,
     current: &'a [ElementSnapshot],
 ) -> Result<&'a ElementSnapshot, RuntimeError> {
-    let matches: Vec<_> = current
-        .iter()
-        .filter(|candidate| {
-            candidate.node.object == old.node.object && same_role_name(candidate, old)
-        })
-        .collect();
-    match matches.as_slice() {
-        [candidate] => return usable(candidate),
-        [] => {}
-        _ => return Err(operational_error("element object identity is ambiguous")),
+    let mut matches = current.iter().filter(|candidate| {
+        candidate.node.object == old.node.object && same_role_name(candidate, old)
+    });
+    let Some(candidate) = matches.next() else {
+        return Err(operational_error(
+            "element object identity changed; call observe again",
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(operational_error("element object identity is ambiguous"));
     }
-    Err(operational_error(
-        "element object identity changed; call observe again",
-    ))
+    usable(candidate)
 }
 
 fn same_role_name(candidate: &ElementSnapshot, old: &ElementSnapshot) -> bool {
@@ -1215,80 +1229,77 @@ fn usable(element: &ElementSnapshot) -> Result<&ElementSnapshot, RuntimeError> {
     Ok(element)
 }
 
-#[derive(Debug)]
-enum ElementOperation {
-    Invoke,
-    Named(String),
-    Focus,
-    SetValue(String),
-}
-
-impl ElementOperation {
-    fn to_semantic(&self, element: &ElementSnapshot) -> Result<SemanticAction, RuntimeError> {
-        match self {
-            Self::Invoke => {
-                if element.node.interface_inspection_failed || element.node.action_inspection_failed
-                {
-                    return Err(operational_error(
+fn semantic_action(
+    action: ElementAction,
+    element: &ElementSnapshot,
+) -> Result<SemanticAction, RuntimeError> {
+    match action {
+        ElementAction::Invoke => {
+            let actions = element
+                .node
+                .capabilities
+                .inspected_actions()
+                .map_err(|()| {
+                    operational_error(
                         "AT-SPI action capability inspection failed for the target element",
-                    ));
-                }
-                match primary_action_index(&element.node.actions) {
-                    Some(index) => i32::try_from(index)
-                        .map(SemanticAction::InvokeAction)
-                        .map_err(|_| operational_error("AT-SPI action index overflow")),
-                    None => Err(operational_error(
-                        "element exposes no recognized primary AT-SPI action",
-                    )),
-                }
+                    )
+                })?;
+            match primary_action_index(actions) {
+                Some(index) => i32::try_from(index)
+                    .map(SemanticAction::InvokeAction)
+                    .map_err(|_| operational_error("AT-SPI action index overflow")),
+                None => Err(operational_error(
+                    "element exposes no recognized primary AT-SPI action",
+                )),
             }
-            Self::Named(requested) => {
-                if element.node.interface_inspection_failed || element.node.action_inspection_failed
-                {
-                    return Err(operational_error(
+        }
+        ElementAction::Named(requested) => {
+            let actions = element
+                .node
+                .capabilities
+                .inspected_actions()
+                .map_err(|()| {
+                    operational_error(
                         "AT-SPI action capability inspection failed for the target element",
-                    ));
-                }
-                let matches: Vec<_> = element
-                    .node
-                    .actions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, action)| {
-                        action.name.eq_ignore_ascii_case(requested)
-                            || action.description.eq_ignore_ascii_case(requested)
-                    })
-                    .collect();
-                match matches.as_slice() {
-                    [(index, _)] => i32::try_from(*index)
-                        .map(SemanticAction::InvokeAction)
-                        .map_err(|_| operational_error("AT-SPI action index overflow")),
-                    [] => Err(operational_error(format!(
-                        "named action {requested:?} is not exposed by the element"
-                    ))),
-                    _ => Err(operational_error(format!(
-                        "named action {requested:?} matches more than one action"
-                    ))),
-                }
+                    )
+                })?;
+            let matches: Vec<_> = actions
+                .iter()
+                .enumerate()
+                .filter(|(_, action)| {
+                    action.name.eq_ignore_ascii_case(&requested)
+                        || action.description.eq_ignore_ascii_case(&requested)
+                })
+                .collect();
+            match matches.as_slice() {
+                [(index, _)] => i32::try_from(*index)
+                    .map(SemanticAction::InvokeAction)
+                    .map_err(|_| operational_error("AT-SPI action index overflow")),
+                [] => Err(operational_error(format!(
+                    "named action {requested:?} is not exposed by the element"
+                ))),
+                _ => Err(operational_error(format!(
+                    "named action {requested:?} matches more than one action"
+                ))),
             }
-            Self::Focus => {
-                if element.node.interface_inspection_failed || !element.node.component_interface {
-                    return Err(capability_error(
-                        "element does not expose a proven AT-SPI Component focus capability",
-                    ));
-                }
-                Ok(SemanticAction::GrabFocus)
+        }
+        ElementAction::Focus => {
+            if !element.node.capabilities.supports_focus() {
+                return Err(capability_error(
+                    "element does not expose a proven AT-SPI Component focus capability",
+                ));
             }
-            Self::SetValue(value) => {
-                if element.node.interface_inspection_failed {
-                    return Err(operational_error(
-                        "AT-SPI interface inspection failed for the target element",
-                    ));
-                }
-                if element.node.editable_text {
-                    return Ok(SemanticAction::ReplaceText(value.clone()));
-                }
-                if element.node.value_interface {
+            Ok(SemanticAction::GrabFocus)
+        }
+        ElementAction::SetValue(value) => {
+            if !element.node.capabilities.interfaces_inspected() {
+                return Err(operational_error(
+                    "AT-SPI interface inspection failed for the target element",
+                ));
+            }
+            match element.node.capabilities.set_value_kind() {
+                Some(SetValueKind::Text) => Ok(SemanticAction::ReplaceText(value)),
+                Some(SetValueKind::Number) => {
                     let numeric = value.parse::<f64>().map_err(|_| {
                         operational_error("AT-SPI Value requires a finite numeric value")
                     })?;
@@ -1297,11 +1308,11 @@ impl ElementOperation {
                             "AT-SPI Value requires a finite numeric value",
                         ));
                     }
-                    return Ok(SemanticAction::SetNumericValue(numeric));
+                    Ok(SemanticAction::SetNumericValue(numeric))
                 }
-                Err(operational_error(
+                None => Err(operational_error(
                     "element supports neither EditableText nor Value",
-                ))
+                )),
             }
         }
     }
@@ -1340,7 +1351,7 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
         if let Some(value) = value {
             output.push_str(&format!(
                 " value=\"{}\"",
-                escape(&truncate(value, snapshot.text_limit))
+                escape(&truncate(value, snapshot.limits.text))
             ));
         }
         let capabilities = text_capabilities(element);
@@ -1349,12 +1360,11 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
             output.push_str(&capabilities.join(", "));
             output.push(']');
         }
-        if !element.node.actions.is_empty() {
+        let actions = element.node.capabilities.actions();
+        if !actions.is_empty() {
             output.push_str(" actions=[");
             output.push_str(
-                &element
-                    .node
-                    .actions
+                &actions
                     .iter()
                     .map(|action| {
                         if action.description.is_empty() {
@@ -1368,7 +1378,7 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
             );
             output.push(']');
         }
-        if let Some(frame) = element.frame {
+        if let Some(frame) = element.node.window_frame {
             output.push_str(&format!(
                 " frame_atspi_window=({}, {}, {}, {})",
                 frame.x, frame.y, frame.width, frame.height
@@ -1384,7 +1394,7 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
                 .selected_text
                 .as_ref()
                 .filter(|text| !text.is_empty())
-                .map(|text| truncate(text, snapshot.text_limit));
+                .map(|text| truncate(text, snapshot.limits.text));
         }
     }
     if let Some(index) = focused {
@@ -1462,41 +1472,39 @@ fn object_metadata(object: &ObjectId) -> serde_json::Value {
 
 fn text_capabilities(element: &ElementSnapshot) -> Vec<String> {
     let mut capabilities = Vec::new();
-    if !element.node.interface_inspection_failed
-        && !element.node.action_inspection_failed
-        && primary_action_index(&element.node.actions).is_some()
+    if element
+        .node
+        .capabilities
+        .inspected_actions()
+        .is_ok_and(|actions| primary_action_index(actions).is_some())
     {
         capabilities.push("invoke".into());
     }
-    if !element.node.interface_inspection_failed && element.node.component_interface {
+    if element.node.capabilities.supports_focus() {
         capabilities.push("focus".into());
     }
-    if !element.node.interface_inspection_failed && element.node.editable_text {
-        capabilities.push("set_value:text".into());
-    } else if !element.node.interface_inspection_failed && element.node.value_interface {
-        capabilities.push("set_value:number".into());
+    match element.node.capabilities.set_value_kind() {
+        Some(SetValueKind::Text) => capabilities.push("set_value:text".into()),
+        Some(SetValueKind::Number) => capabilities.push("set_value:number".into()),
+        None => {}
     }
     capabilities
 }
 
 fn element_capabilities(index: usize, element: &ElementSnapshot) -> serde_json::Value {
-    let inspection_complete =
-        !element.node.interface_inspection_failed && !element.node.action_inspection_failed;
-    let set_value = if element.node.interface_inspection_failed {
-        None
-    } else if element.node.editable_text {
-        Some("text")
-    } else if element.node.value_interface {
-        Some("number")
-    } else {
-        None
+    let inspection_complete = element.node.capabilities.inspection_complete();
+    let set_value = match element.node.capabilities.set_value_kind() {
+        Some(SetValueKind::Text) => Some("text"),
+        Some(SetValueKind::Number) => Some("number"),
+        None => None,
     };
+    let actions = element.node.capabilities.actions();
     json!({
         "element_id": index.to_string(),
         "inspection_complete": inspection_complete,
-        "invoke": inspection_complete && primary_action_index(&element.node.actions).is_some(),
-        "focus": !element.node.interface_inspection_failed && element.node.component_interface,
-        "named_actions": element.node.actions.iter().map(|action| json!({
+        "invoke": inspection_complete && primary_action_index(actions).is_some(),
+        "focus": element.node.capabilities.supports_focus(),
+        "named_actions": actions.iter().map(|action| json!({
             "name": action.name,
             "description": action.description
         })).collect::<Vec<_>>(),
@@ -1650,7 +1658,7 @@ fn completed_without_observation(error: RuntimeError) -> RuntimeError {
 fn cached_element<'a>(
     snapshot: &'a Snapshot,
     index: &str,
-) -> Result<(usize, &'a ElementSnapshot), RuntimeError> {
+) -> Result<&'a ElementSnapshot, RuntimeError> {
     let parsed = index
         .parse::<usize>()
         .map_err(|_| operational_error(format!("element_id {index:?} is not a snapshot index")))?;
@@ -1660,7 +1668,7 @@ fn cached_element<'a>(
             snapshot.generation
         ))
     })?;
-    Ok((parsed, element))
+    Ok(element)
 }
 
 #[cfg(test)]
@@ -1668,7 +1676,10 @@ mod tests {
     use std::{collections::HashMap, future, sync::Arc};
 
     use super::*;
-    use crate::validation::MouseButton;
+    use crate::{
+        screenshot::ScreenshotError,
+        validation::{KeyboardAction, MouseButton, PointerAction},
+    };
 
     #[test]
     fn all_resolution_tiers_and_ambiguities_are_strict() {
@@ -1749,7 +1760,13 @@ mod tests {
         node.text = Some("é🙂tail".into());
         node.selected_text = Some("a\nb".into());
         node.states.insert("focused".into());
-        node.actions = vec![
+        node.window_frame = Some(Rect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        });
+        node.capabilities = inspected(ActionCapabilities::Inspected(vec![
             ActionInfo {
                 name: "click".into(),
                 description: String::new(),
@@ -1758,29 +1775,20 @@ mod tests {
                 name: "menu".into(),
                 description: "Show\nmenu".into(),
             },
-        ];
+        ]));
         let snapshot = Snapshot {
             app_query: "Editor".into(),
             app: app("Editor", 1, "Main"),
             window: window("Main", &["active"]),
             generation: 2,
-            elements: vec![ElementSnapshot {
-                depth: 0,
-                tree_path: vec![],
-                frame: Some(Rect {
-                    x: 1,
-                    y: 2,
-                    width: 3,
-                    height: 4,
-                }),
-                node,
-            }],
+            elements: vec![ElementSnapshot { depth: 0, node }],
             node_limit_reached: true,
             depth_limit_reached: true,
-            text_limit: 2,
-            max_nodes: 10,
-            max_depth: 10,
-            screenshot_mapping: None,
+            limits: SnapshotLimits {
+                text: 2,
+                nodes: 10,
+                depth: 10,
+            },
         };
         let text = format_snapshot(&snapshot);
         assert!(text.contains("line\\r\\n\\\"name"));
@@ -1795,8 +1803,8 @@ mod tests {
 
     #[test]
     fn click_uses_only_a_recognized_primary_action() {
-        let mut target = element(node("button", "button", "Menu"), vec![0], None);
-        target.node.actions = vec![
+        let mut target = element(node("button", "button", "Menu"), 1, None);
+        target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![
             ActionInfo {
                 name: "show menu".into(),
                 description: String::new(),
@@ -1805,27 +1813,33 @@ mod tests {
                 name: "activate".into(),
                 description: String::new(),
             },
-        ];
+        ]));
         assert_eq!(
-            ElementOperation::Invoke.to_semantic(&target).unwrap(),
+            semantic_action(ElementAction::Invoke, &target).unwrap(),
             SemanticAction::InvokeAction(1)
         );
-        target.node.actions.pop();
-        assert!(ElementOperation::Invoke.to_semantic(&target).is_err());
-        target.node.component_interface = true;
+        target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![]));
+        assert!(semantic_action(ElementAction::Invoke, &target).is_err());
+        target.node.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
+            actions: ActionCapabilities::InspectionFailed,
+            component: true,
+            editable_text: false,
+            value: false,
+        });
         assert_eq!(
-            ElementOperation::Focus.to_semantic(&target).unwrap(),
+            semantic_action(ElementAction::Focus, &target).unwrap(),
             SemanticAction::GrabFocus
         );
-        target.node.interface_inspection_failed = true;
-        assert!(ElementOperation::Focus.to_semantic(&target).is_err());
+        assert!(semantic_action(ElementAction::Invoke, &target).is_err());
+        target.node.capabilities = NodeCapabilities::InspectionFailed;
+        assert!(semantic_action(ElementAction::Focus, &target).is_err());
     }
 
     #[test]
     fn relocation_requires_exact_object_identity() {
         let old = element(
             node("old", "button", "Save"),
-            vec![0],
+            1,
             Some(Rect {
                 x: 1,
                 y: 1,
@@ -1833,7 +1847,7 @@ mod tests {
                 height: 10,
             }),
         );
-        let replaced = element(node("new", "button", "Save"), vec![1], old.frame);
+        let replaced = element(node("new", "button", "Save"), 1, old.node.window_frame);
         assert!(
             relocate(&old, &[replaced])
                 .unwrap_err()
@@ -1878,11 +1892,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Main", "Button", "Editor"]
         );
-        assert_eq!(snapshot.elements[1].tree_path, [0]);
-        assert_eq!(snapshot.elements[2].tree_path, [1]);
+        assert_eq!(snapshot.elements[1].depth, 1);
+        assert_eq!(snapshot.elements[2].depth, 1);
         assert!(snapshot.node_limit_reached);
         assert!(snapshot.depth_limit_reached);
-        assert_eq!(snapshot.elements[1].frame.unwrap().x, 10);
+        assert_eq!(snapshot.elements[1].node.window_frame.unwrap().x, 10);
     }
 
     #[tokio::test]
@@ -1914,7 +1928,10 @@ mod tests {
             .iter()
             .find(|element| element.node.name == "Zoom")
             .unwrap();
-        assert!(slider.node.value_interface);
+        assert_eq!(
+            slider.node.capabilities.set_value_kind(),
+            Some(SetValueKind::Number)
+        );
         assert!(slider.node.value.is_none());
         assert!(text.contains("name=\"Zoom\""));
         assert!(text.contains("Screenshot unavailable"));
@@ -1956,7 +1973,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, "Main"), (1, "Button"), (2, "Editor"), (3, "Zoom")]
         );
-        assert_eq!(snapshot.elements[2].tree_path, [3]);
+        assert_eq!(snapshot.elements[2].depth, 1);
         assert!(!snapshot.node_limit_reached);
         assert!(!snapshot.depth_limit_reached);
     }
@@ -2238,10 +2255,7 @@ mod tests {
     async fn generated_input_failure_invalidates_state_before_dispatch() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        use crate::{
-            geometry::{PixelRect, Transform},
-            screenshot::{PrepareCapture, ScreenshotFuture, ScreenshotObservation},
-        };
+        use crate::screenshot::{PrepareCapture, ScreenshotObservation};
 
         struct FakeScreenshots {
             prepared: AtomicBool,
@@ -2249,74 +2263,36 @@ mod tests {
         }
 
         impl ScreenshotProvider for FakeScreenshots {
-            fn prepare(&self) -> ScreenshotFuture<'_, PrepareCapture> {
+            fn prepare(
+                &self,
+            ) -> impl Future<Output = Result<PrepareCapture, ScreenshotError>> + Send + '_
+            {
                 let interrupted = !self.prepared.swap(true, Ordering::AcqRel);
-                Box::pin(async move {
+                async move {
                     Ok(PrepareCapture {
                         consent_interrupted_observation: interrupted,
                     })
-                })
+                }
             }
 
-            fn capture<'a>(
+            async fn capture<'a>(
                 &'a self,
                 snapshot: &'a Snapshot,
-            ) -> ScreenshotFuture<'a, ScreenshotObservation> {
-                Box::pin(async move {
-                    Ok(ScreenshotObservation {
-                        png_base64: "cG5n".into(),
-                        mapping: ScreenshotMapping {
-                            app_pid: snapshot.app.pid,
-                            app_identity: snapshot.app.object.clone(),
-                            window_identity: snapshot.window.object.clone(),
-                            accessibility_generation: snapshot.generation,
-                            portal_session_identity: "/session/test".into(),
-                            portal_session_generation: 4,
-                            remote_desktop_devices:
-                                crate::portal::GrantedDevices::from_mask_for_mapping(3),
-                            stream_index: 2,
-                            stream_id: Some("stream".into()),
-                            stream_position: Some((0, 0)),
-                            stream_logical_size: Some((800, 600)),
-                            pipewire_node_id: 8,
-                            pipewire_serial: Some(99),
-                            source_frame_generation: 7,
-                            source_format_generation: 1,
-                            source_frame_size: (800, 600),
-                            original_frame_crop: PixelRect {
-                                x: 0,
-                                y: 0,
-                                width: 800,
-                                height: 600,
-                            },
-                            transformed_monitor_crop: PixelRect {
-                                x: 0,
-                                y: 0,
-                                width: 800,
-                                height: 600,
-                            },
-                            output_png_size: (800, 600),
-                            png_to_transformed_x: 1.0,
-                            png_to_transformed_y: 1.0,
-                            scale_x: 1.0,
-                            scale_y: 1.0,
-                            transform: Transform::Normal,
-                            mapping_id: Some("mapping".into()),
-                        },
-                    })
+            ) -> Result<ScreenshotObservation, ScreenshotError> {
+                Ok(ScreenshotObservation {
+                    png_base64: "cG5n".into(),
+                    mapping: test_screenshot_mapping(snapshot, "/session/test", Some("mapping")),
                 })
             }
-        }
 
-        impl crate::input::GeneratedInputProvider for FakeScreenshots {
             fn perform_input<'a>(
                 &'a self,
                 _snapshot: &'a Snapshot,
                 _mapping: &'a ScreenshotMapping,
                 _action: crate::input::GeneratedInputAction,
-            ) -> crate::input::GeneratedInputFuture<'a> {
+            ) -> impl Future<Output = Result<(), String>> + Send + 'a {
                 self.generated.fetch_add(1, Ordering::AcqRel);
-                Box::pin(async { Err("fake does not send generated input".into()) })
+                async { Err("fake does not send generated input".into()) }
             }
         }
 
@@ -2348,7 +2324,7 @@ mod tests {
         assert_eq!(metadata["elements"][2]["set_value"], "text");
         assert_eq!(metadata["elements"][3]["set_value"], "number");
         let mapping = runtime.screenshot_mapping(&state_id).unwrap().unwrap();
-        assert_eq!(mapping.mapping_id.as_deref(), Some("mapping"));
+        assert_eq!(mapping.stream.mapping_id.as_deref(), Some("mapping"));
         assert_eq!(mapping.accessibility_generation, 2);
         assert!(fake.state.lock().unwrap().discoveries >= 2);
 
@@ -2381,9 +2357,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use crate::{
-            geometry::{PixelRect, Transform},
-            input::{GeneratedInputAction, GeneratedInputFuture, GeneratedInputProvider},
-            screenshot::{PrepareCapture, ScreenshotFuture, ScreenshotObservation},
+            input::GeneratedInputAction,
+            screenshot::{PrepareCapture, ScreenshotObservation},
         };
 
         struct ConcurrentScreenshots {
@@ -2394,9 +2369,12 @@ mod tests {
         }
 
         impl ScreenshotProvider for ConcurrentScreenshots {
-            fn prepare(&self) -> ScreenshotFuture<'_, PrepareCapture> {
+            fn prepare(
+                &self,
+            ) -> impl Future<Output = Result<PrepareCapture, ScreenshotError>> + Send + '_
+            {
                 let call = self.prepares.fetch_add(1, Ordering::AcqRel);
-                Box::pin(async move {
+                async move {
                     if call == 1 {
                         self.entered.notify_one();
                         self.release.notified().await;
@@ -2404,68 +2382,27 @@ mod tests {
                     Ok(PrepareCapture {
                         consent_interrupted_observation: false,
                     })
-                })
+                }
             }
 
-            fn capture<'a>(
+            async fn capture<'a>(
                 &'a self,
                 snapshot: &'a Snapshot,
-            ) -> ScreenshotFuture<'a, ScreenshotObservation> {
-                Box::pin(async move {
-                    Ok(ScreenshotObservation {
-                        png_base64: "cG5n".into(),
-                        mapping: ScreenshotMapping {
-                            app_pid: snapshot.app.pid,
-                            app_identity: snapshot.app.object.clone(),
-                            window_identity: snapshot.window.object.clone(),
-                            accessibility_generation: snapshot.generation,
-                            portal_session_identity: "/session/concurrent".into(),
-                            portal_session_generation: 1,
-                            remote_desktop_devices:
-                                crate::portal::GrantedDevices::from_mask_for_mapping(3),
-                            stream_index: 0,
-                            stream_id: Some("stream".into()),
-                            stream_position: Some((0, 0)),
-                            stream_logical_size: Some((800, 600)),
-                            pipewire_node_id: 1,
-                            pipewire_serial: Some(2),
-                            source_frame_generation: snapshot.generation,
-                            source_format_generation: 1,
-                            source_frame_size: (800, 600),
-                            original_frame_crop: PixelRect {
-                                x: 0,
-                                y: 0,
-                                width: 800,
-                                height: 600,
-                            },
-                            transformed_monitor_crop: PixelRect {
-                                x: 0,
-                                y: 0,
-                                width: 800,
-                                height: 600,
-                            },
-                            output_png_size: (800, 600),
-                            png_to_transformed_x: 1.0,
-                            png_to_transformed_y: 1.0,
-                            scale_x: 1.0,
-                            scale_y: 1.0,
-                            transform: Transform::Normal,
-                            mapping_id: None,
-                        },
-                    })
+            ) -> Result<ScreenshotObservation, ScreenshotError> {
+                Ok(ScreenshotObservation {
+                    png_base64: "cG5n".into(),
+                    mapping: test_screenshot_mapping(snapshot, "/session/concurrent", None),
                 })
             }
-        }
 
-        impl GeneratedInputProvider for ConcurrentScreenshots {
             fn perform_input<'a>(
                 &'a self,
                 _snapshot: &'a Snapshot,
                 _mapping: &'a ScreenshotMapping,
                 _action: GeneratedInputAction,
-            ) -> GeneratedInputFuture<'a> {
+            ) -> impl Future<Output = Result<(), String>> + Send + 'a {
                 self.generated.fetch_add(1, Ordering::AcqRel);
-                Box::pin(async { Ok(()) })
+                async { Ok(()) }
             }
         }
 
@@ -2568,18 +2505,74 @@ mod tests {
             .await
     }
 
-    fn current_snapshot<A, S>(runtime: &SemanticRuntime<A, S>) -> Snapshot
+    fn test_screenshot_mapping(
+        snapshot: &Snapshot,
+        session: &str,
+        mapping_id: Option<&str>,
+    ) -> ScreenshotMapping {
+        let crop = crate::geometry::PixelRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        ScreenshotMapping {
+            app_pid: snapshot.app.pid,
+            app_identity: snapshot.app.object.clone(),
+            window_identity: snapshot.window.object.clone(),
+            accessibility_generation: snapshot.generation,
+            portal_session_identity: session.into(),
+            portal_session_generation: 1,
+            remote_desktop_devices: crate::portal::GrantedDevices::from_mask_for_mapping(3),
+            stream: crate::portal::PortalStream {
+                stream_index: 0,
+                node_id: 1,
+                pipewire_serial: Some(2),
+                id: Some("stream".into()),
+                mapping_id: mapping_id.map(str::to_owned),
+                position: Some((0, 0)),
+                logical_size: Some((800, 600)),
+            },
+            source: crate::capture::FrameMetadata {
+                generation: snapshot.generation,
+                format_generation: 1,
+                size: (800, 600),
+                crop,
+                transform: crate::geometry::Transform::Normal,
+            },
+            monitor: crate::geometry::MonitorMapping {
+                transformed_crop: crop,
+                scale_x: 1.0,
+                scale_y: 1.0,
+            },
+            output: crate::encoder::PngMapping {
+                size: (800, 600),
+                png_to_transformed_x: 1.0,
+                png_to_transformed_y: 1.0,
+            },
+        }
+    }
+
+    fn current_snapshot<A, S>(runtime: &SemanticRuntime<A, S>) -> Arc<Snapshot>
     where
         A: AccessibilityAdapter,
-        S: ScreenshotProvider + GeneratedInputProvider,
+        S: ScreenshotProvider,
     {
-        runtime.lock_cache().unwrap().current.clone().unwrap()
+        Arc::clone(
+            &runtime
+                .lock_cache()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .snapshot,
+        )
     }
 
     fn current_state_id<A, S>(runtime: &SemanticRuntime<A, S>) -> String
     where
         A: AccessibilityAdapter,
-        S: ScreenshotProvider + GeneratedInputProvider,
+        S: ScreenshotProvider,
     {
         snapshot_state_id(&current_snapshot(runtime))
     }
@@ -2610,76 +2603,30 @@ mod tests {
     }
 
     impl ScreenshotProvider for MutatingScreenshots {
-        fn prepare(
-            &self,
-        ) -> crate::screenshot::ScreenshotFuture<'_, crate::screenshot::PrepareCapture> {
-            Box::pin(async {
-                Ok(crate::screenshot::PrepareCapture {
-                    consent_interrupted_observation: false,
-                })
+        async fn prepare(&self) -> Result<crate::screenshot::PrepareCapture, ScreenshotError> {
+            Ok(crate::screenshot::PrepareCapture {
+                consent_interrupted_observation: false,
             })
         }
 
-        fn capture<'a>(
+        async fn capture<'a>(
             &'a self,
             snapshot: &'a Snapshot,
-        ) -> crate::screenshot::ScreenshotFuture<'a, crate::screenshot::ScreenshotObservation>
-        {
-            Box::pin(async move {
-                self.mutate();
-                Ok(crate::screenshot::ScreenshotObservation {
-                    png_base64: "cG5n".into(),
-                    mapping: ScreenshotMapping {
-                        app_pid: snapshot.app.pid,
-                        app_identity: snapshot.app.object.clone(),
-                        window_identity: snapshot.window.object.clone(),
-                        accessibility_generation: snapshot.generation,
-                        portal_session_identity: "/session/revalidation".into(),
-                        portal_session_generation: 1,
-                        remote_desktop_devices:
-                            crate::portal::GrantedDevices::from_mask_for_mapping(3),
-                        stream_index: 0,
-                        stream_id: None,
-                        stream_position: Some((0, 0)),
-                        stream_logical_size: Some((800, 600)),
-                        pipewire_node_id: 1,
-                        pipewire_serial: None,
-                        source_frame_generation: 1,
-                        source_format_generation: 1,
-                        source_frame_size: (800, 600),
-                        original_frame_crop: crate::geometry::PixelRect {
-                            x: 0,
-                            y: 0,
-                            width: 800,
-                            height: 600,
-                        },
-                        transformed_monitor_crop: crate::geometry::PixelRect {
-                            x: 0,
-                            y: 0,
-                            width: 800,
-                            height: 600,
-                        },
-                        output_png_size: (800, 600),
-                        png_to_transformed_x: 1.0,
-                        png_to_transformed_y: 1.0,
-                        scale_x: 1.0,
-                        scale_y: 1.0,
-                        transform: crate::geometry::Transform::Normal,
-                        mapping_id: None,
-                    },
-                })
+        ) -> Result<crate::screenshot::ScreenshotObservation, ScreenshotError> {
+            self.mutate();
+            Ok(crate::screenshot::ScreenshotObservation {
+                png_base64: "cG5n".into(),
+                mapping: test_screenshot_mapping(snapshot, "/session/revalidation", None),
             })
         }
-    }
 
-    impl crate::input::GeneratedInputProvider for MutatingScreenshots {
-        fn perform_input<'a>(
+        async fn perform_input<'a>(
             &'a self,
             _snapshot: &'a Snapshot,
             _mapping: &'a ScreenshotMapping,
             _action: crate::input::GeneratedInputAction,
-        ) -> crate::input::GeneratedInputFuture<'a> {
-            Box::pin(async { Ok(()) })
+        ) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -2695,8 +2642,7 @@ mod tests {
             root.children = vec![id("button"), id("edit"), id("slider")];
 
             let mut button = node("button", "button", "Button");
-            button.accessible_id = Some("button-id".into());
-            button.actions = vec![
+            button.capabilities = inspected(ActionCapabilities::Inspected(vec![
                 ActionInfo {
                     name: "default".into(),
                     description: "Default".into(),
@@ -2709,7 +2655,7 @@ mod tests {
                     name: "menu".into(),
                     description: "Show Menu".into(),
                 },
-            ];
+            ]));
             button.window_frame = Some(Rect {
                 x: 10,
                 y: 20,
@@ -2718,12 +2664,22 @@ mod tests {
             });
 
             let mut edit = node("edit", "text", "Editor");
-            edit.editable_text = true;
+            edit.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
+                actions: ActionCapabilities::Unsupported,
+                component: false,
+                editable_text: true,
+                value: false,
+            });
             edit.states.insert("editable".into());
             edit.states.insert("focused".into());
 
             let mut slider = node("slider", "slider", "Zoom");
-            slider.value_interface = true;
+            slider.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
+                actions: ActionCapabilities::Unsupported,
+                component: false,
+                editable_text: false,
+                value: true,
+            });
 
             let nodes = [root, button, edit, slider]
                 .into_iter()
@@ -2745,46 +2701,40 @@ mod tests {
     }
 
     impl AccessibilityAdapter for FakeAdapter {
-        fn discover(&self) -> AdapterFuture<'_, Vec<AppInfo>> {
-            Box::pin(async move {
-                let mut state = self.state.lock().unwrap();
-                state.discoveries += 1;
-                Ok(vec![state.app.clone()])
-            })
+        async fn discover(&self) -> Result<Vec<AppInfo>, RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state.discoveries += 1;
+            Ok(vec![state.app.clone()])
         }
 
-        fn read_node<'a>(
+        async fn read_node<'a>(
             &'a self,
             object: &'a ObjectId,
             _text_limit: usize,
-        ) -> AdapterFuture<'a, NodeInfo> {
-            Box::pin(async move {
-                if self.state.lock().unwrap().block_reads {
-                    future::pending::<()>().await;
-                }
-                self.state
-                    .lock()
-                    .unwrap()
-                    .nodes
-                    .get(object)
-                    .cloned()
-                    .ok_or_else(|| operational_error("stale fake object path"))
-            })
+        ) -> Result<NodeInfo, RuntimeError> {
+            if self.state.lock().unwrap().block_reads {
+                future::pending::<()>().await;
+            }
+            self.state
+                .lock()
+                .unwrap()
+                .nodes
+                .get(object)
+                .cloned()
+                .ok_or_else(|| operational_error("stale fake object path"))
         }
 
-        fn act<'a>(
+        async fn act<'a>(
             &'a self,
             object: &'a ObjectId,
             action: SemanticAction,
-        ) -> AdapterFuture<'a, ()> {
-            Box::pin(async move {
-                let mut state = self.state.lock().unwrap();
-                state.actions.push((object.clone(), action));
-                if state.fail_actions {
-                    return Err(operational_error("fake semantic action failure"));
-                }
-                Ok(())
-            })
+        ) -> Result<(), RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state.actions.push((object.clone(), action));
+            if state.fail_actions {
+                return Err(operational_error("fake semantic action failure"));
+            }
+            Ok(())
         }
     }
 
@@ -2835,30 +2785,29 @@ mod tests {
     fn node(path: &str, role: &str, name: &str) -> NodeInfo {
         NodeInfo {
             object: id(path),
-            accessible_id: (name == "Save").then(|| "save".into()),
             role: role.into(),
             name: name.into(),
             value: None,
             text: None,
             selected_text: None,
             states: BTreeSet::new(),
-            actions: vec![],
-            editable_text: false,
-            value_interface: false,
-            interface_inspection_failed: false,
-            action_inspection_failed: false,
-            component_interface: false,
+            capabilities: inspected(ActionCapabilities::Unsupported),
             window_frame: None,
             children: vec![],
         }
     }
 
-    fn element(node: NodeInfo, tree_path: Vec<usize>, frame: Option<Rect>) -> ElementSnapshot {
-        ElementSnapshot {
-            depth: tree_path.len(),
-            tree_path,
-            node,
-            frame,
-        }
+    fn inspected(actions: ActionCapabilities) -> NodeCapabilities {
+        NodeCapabilities::Inspected(InspectedCapabilities {
+            actions,
+            component: false,
+            editable_text: false,
+            value: false,
+        })
+    }
+
+    fn element(mut node: NodeInfo, depth: usize, frame: Option<Rect>) -> ElementSnapshot {
+        node.window_frame = frame;
+        ElementSnapshot { depth, node }
     }
 }

@@ -178,9 +178,10 @@ async fn execute_calls<R: DesktopRuntime, W: Write>(
     output: &mut W,
 ) -> Result<(), CliError> {
     for (index, value) in calls.into_iter().enumerate() {
+        let number = index + 1;
         let (name, arguments) = parse_call(value, index)?;
         let call = validate_call(&name, arguments).map_err(|error| {
-            CliError::InvalidArguments(format!("call {} ({name}) is invalid: {error}", index + 1))
+            CliError::InvalidArguments(format!("call {number} ({name}) is invalid: {error}"))
         })?;
         let (result, failed) = match runtime.execute(call).await {
             Ok(output) => (output.into_mcp_result(), false),
@@ -197,8 +198,7 @@ async fn execute_calls<R: DesktopRuntime, W: Write>(
         })?;
         if failed {
             return Err(CliError::Mcp(format!(
-                "call {} ({name}) failed; remaining calls were not executed",
-                index + 1
+                "call {number} ({name}) failed; remaining calls were not executed"
             )));
         }
     }
@@ -206,10 +206,10 @@ async fn execute_calls<R: DesktopRuntime, W: Write>(
 }
 
 fn parse_call(value: Value, index: usize) -> Result<(String, JsonObject<String, Value>), CliError> {
+    let number = index + 1;
     let Value::Object(mut object) = value else {
         return Err(CliError::InvalidArguments(format!(
-            "call {} must be an object",
-            index + 1
+            "call {number} must be an object"
         )));
     };
     let name = object
@@ -217,25 +217,20 @@ fn parse_call(value: Value, index: usize) -> Result<(String, JsonObject<String, 
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            CliError::InvalidArguments(format!(
-                "call {} requires a non-empty string name",
-                index + 1
-            ))
+            CliError::InvalidArguments(format!("call {number} requires a non-empty string name"))
         })?;
     let arguments = match object.remove("arguments") {
         Some(Value::Object(arguments)) => arguments,
         None => JsonObject::new(),
         Some(_) => {
             return Err(CliError::InvalidArguments(format!(
-                "call {} arguments must be an object",
-                index + 1
+                "call {number} arguments must be an object"
             )));
         }
     };
     if let Some(field) = object.keys().next() {
         return Err(CliError::InvalidArguments(format!(
-            "call {} has unknown field {field:?}",
-            index + 1
+            "call {number} has unknown field {field:?}"
         )));
     }
     Ok((name, arguments))
@@ -251,14 +246,7 @@ async fn doctor() {
         .filter(|value| !value.is_empty());
     let wayland_ready = session_type.as_deref() == Some("wayland") && display.is_some();
     println!("\n[Wayland session]");
-    println!(
-        "Status: {}",
-        if wayland_ready {
-            "READY"
-        } else {
-            "UNAVAILABLE"
-        }
-    );
+    print_doctor_status(wayland_ready);
     println!(
         "Session type: {}",
         session_type.as_deref().unwrap_or("<unset>")
@@ -270,26 +258,13 @@ async fn doctor() {
 
     println!("\n[Accessibility (AT-SPI)]");
     let atspi = SemanticRuntime::new(AtspiAdapter::default());
-    match atspi.list_apps_text().await {
-        Ok(_) => println!("Status: READY"),
-        Err(error) => {
-            println!("Status: UNAVAILABLE");
-            println!("Detail: {error}");
-        }
-    }
+    print_doctor_result(atspi.list_apps_text().await);
 
     println!("\n[XDG desktop portal]");
     match XdgPortalBackend::default().capabilities().await {
         Ok(capabilities) => {
             let validation = validate_capabilities(&capabilities);
-            println!(
-                "Status: {}",
-                if validation.is_ok() {
-                    "READY"
-                } else {
-                    "UNAVAILABLE"
-                }
-            );
+            print_doctor_status(validation.is_ok());
             println!(
                 "RemoteDesktop: v{} (need v2+)",
                 capabilities.remote_desktop_version
@@ -300,35 +275,19 @@ async fn doctor() {
             );
             println!(
                 "Keyboard input: {}",
-                if capabilities.available_device_types & 1 != 0 {
-                    "available"
-                } else {
-                    "missing"
-                }
+                availability(capabilities.available_device_types & 1 != 0)
             );
             println!(
                 "Pointer input: {}",
-                if capabilities.available_device_types & 2 != 0 {
-                    "available"
-                } else {
-                    "missing"
-                }
+                availability(capabilities.available_device_types & 2 != 0)
             );
             println!(
                 "Monitor capture: {}",
-                if capabilities.available_source_types & 1 != 0 {
-                    "available"
-                } else {
-                    "missing"
-                }
+                availability(capabilities.available_source_types & 1 != 0)
             );
             println!(
                 "Cursor capture: {}",
-                if capabilities.available_cursor_modes & 3 != 0 {
-                    "available"
-                } else {
-                    "missing"
-                }
+                availability(capabilities.available_cursor_modes & 3 != 0)
             );
             if let Err(error) = validation {
                 println!("Detail: {error}");
@@ -341,18 +300,30 @@ async fn doctor() {
     }
 
     println!("\n[PipeWire]");
-    match check_pipewire() {
-        Ok(()) => println!("Status: READY"),
-        Err(error) => {
-            println!("Status: UNAVAILABLE");
-            println!("Detail: {error}");
-        }
-    }
+    print_doctor_result(check_pipewire());
 
     println!("\n[Portal approval and EIS input]");
     println!("Status: NOT TESTED");
     println!("Reason: verifying monitor approval and EIS routing would require consent.");
     println!("Action: run `open-computer-use init`, then use the MCP server.");
+}
+
+fn print_doctor_result<T, E: std::fmt::Display>(result: Result<T, E>) {
+    match result {
+        Ok(_) => print_doctor_status(true),
+        Err(error) => {
+            print_doctor_status(false);
+            println!("Detail: {error}");
+        }
+    }
+}
+
+fn print_doctor_status(ready: bool) {
+    println!("Status: {}", if ready { "READY" } else { "UNAVAILABLE" });
+}
+
+fn availability(available: bool) -> &'static str {
+    if available { "available" } else { "missing" }
 }
 
 fn check_pipewire() -> Result<(), pipewire::Error> {
@@ -380,11 +351,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{
-        errors::RuntimeError,
-        runtime::{RuntimeFuture, ToolOutput},
-        validation::ToolCall,
-    };
+    use crate::{errors::RuntimeError, runtime::ToolOutput, validation::ToolCall};
 
     struct FakeRuntime {
         calls: Mutex<Vec<ToolCall>>,
@@ -392,23 +359,21 @@ mod tests {
     }
 
     impl DesktopRuntime for FakeRuntime {
-        fn execute(&self, call: ToolCall) -> RuntimeFuture<'_> {
-            Box::pin(async move {
-                let mut calls = self.calls.lock().unwrap();
-                calls.push(call);
-                if self.fail_at == Some(calls.len()) {
-                    Err(RuntimeError::not_started(
-                        "planned_failure",
-                        "planned failure",
-                    ))
-                } else {
-                    Ok(ToolOutput::text(format!("call {}", calls.len())))
-                }
-            })
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(call);
+            if self.fail_at == Some(calls.len()) {
+                Err(RuntimeError::not_started(
+                    "planned_failure",
+                    "planned failure",
+                ))
+            } else {
+                Ok(ToolOutput::text(format!("call {}", calls.len())))
+            }
         }
 
-        fn cleanup(&self) -> RuntimeFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
+        async fn cleanup(&self) -> Result<(), RuntimeError> {
+            Ok(())
         }
     }
 

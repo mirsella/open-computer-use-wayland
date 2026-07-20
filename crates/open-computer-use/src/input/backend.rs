@@ -2,14 +2,6 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 pub type InputFuture<'a, T = ()> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct InputCapabilities {
-    pub absolute_pointer: bool,
-    pub button: bool,
-    pub scroll: bool,
-    pub keyboard: bool,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
     Absolute { x: f64, y: f64 },
@@ -47,7 +39,6 @@ impl HeldInput {
 }
 
 pub trait InputBackend: Send + Sync + 'static {
-    fn capabilities(&self) -> InputCapabilities;
     fn begin_sequence(&self) -> InputFuture<'_>;
     fn emit(&self, event: InputEvent) -> InputFuture<'_>;
     fn queue_release(&self, held: Vec<HeldInput>);
@@ -57,8 +48,7 @@ pub trait InputBackend: Send + Sync + 'static {
 pub struct HeldInputGuard {
     backend: Arc<dyn InputBackend>,
     held: Vec<HeldInput>,
-    disarmed: bool,
-    sequence_started: bool,
+    cleanup_needed: bool,
 }
 
 impl HeldInputGuard {
@@ -66,15 +56,13 @@ impl HeldInputGuard {
         Self {
             backend,
             held: Vec::new(),
-            disarmed: false,
-            sequence_started: false,
+            cleanup_needed: false,
         }
     }
 
     pub async fn begin(&mut self) -> Result<(), String> {
-        self.backend.begin_sequence().await?;
-        self.sequence_started = true;
-        Ok(())
+        self.cleanup_needed = true;
+        self.backend.begin_sequence().await
     }
 
     pub async fn press(&mut self, held: HeldInput) -> Result<(), String> {
@@ -111,18 +99,14 @@ impl HeldInputGuard {
             eprintln!("open-computer-use: cleanup barrier failed: {error}");
             first_error.get_or_insert(error);
         }
-        self.disarmed = true;
-        self.sequence_started = false;
+        self.cleanup_needed = false;
         first_error.map_or(Ok(()), Err)
     }
 }
 
 impl Drop for HeldInputGuard {
     fn drop(&mut self) {
-        if self.disarmed {
-            return;
-        }
-        if self.held.is_empty() && !self.sequence_started {
+        if !self.cleanup_needed && self.held.is_empty() {
             return;
         }
         let held = self.held.drain(..).rev().collect();
@@ -155,37 +139,47 @@ pub async fn finish_with_cleanup<T>(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        future,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
 
     pub struct FakeBackend {
-        pub capabilities: InputCapabilities,
         pub events: Mutex<Vec<InputEvent>>,
         pub emergency: Mutex<Vec<HeldInput>>,
+        pub queue_calls: Mutex<Vec<Vec<HeldInput>>>,
         pub fail_at: AtomicUsize,
+        pub fail_begin: AtomicBool,
+        pub pending_releases: AtomicBool,
+        pub cleanup_calls: AtomicUsize,
     }
 
     impl FakeBackend {
-        pub fn new(capabilities: InputCapabilities) -> Arc<Self> {
+        pub fn new() -> Arc<Self> {
             Arc::new(Self {
-                capabilities,
                 events: Mutex::new(Vec::new()),
                 emergency: Mutex::new(Vec::new()),
+                queue_calls: Mutex::new(Vec::new()),
                 fail_at: AtomicUsize::new(usize::MAX),
+                fail_begin: AtomicBool::new(false),
+                pending_releases: AtomicBool::new(false),
+                cleanup_calls: AtomicUsize::new(0),
             })
         }
     }
 
     impl InputBackend for FakeBackend {
-        fn capabilities(&self) -> InputCapabilities {
-            self.capabilities
-        }
-
         fn emit(&self, event: InputEvent) -> InputFuture<'_> {
+            if self.pending_releases.load(Ordering::Acquire)
+                && matches!(event, InputEvent::Keycode { pressed: false, .. })
+            {
+                return Box::pin(future::pending());
+            }
             let index = self.events.lock().unwrap().len();
             let result = if index == self.fail_at.load(Ordering::Acquire) {
                 Err(format!("fake failure at event {index}"))
@@ -197,14 +191,21 @@ pub(crate) mod test_support {
         }
 
         fn begin_sequence(&self) -> InputFuture<'_> {
-            Box::pin(async { Ok(()) })
+            let result = if self.fail_begin.load(Ordering::Acquire) {
+                Err("fake begin failure".into())
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
         }
 
         fn queue_release(&self, held: Vec<HeldInput>) {
+            self.queue_calls.lock().unwrap().push(held.clone());
             self.emergency.lock().unwrap().extend(held);
         }
 
         fn cleanup_barrier(&self) -> InputFuture<'_> {
+            self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
             let held = std::mem::take(&mut *self.emergency.lock().unwrap());
             for input in held {
                 self.events.lock().unwrap().push(input.release_event());
@@ -216,79 +217,13 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future,
-        sync::{
-            Mutex,
-            atomic::{AtomicBool, Ordering},
-        },
-        time::Duration,
-    };
+    use std::{sync::atomic::Ordering, time::Duration};
 
     use super::{test_support::FakeBackend, *};
 
-    struct PendingReleaseBackend {
-        queued: Mutex<Vec<HeldInput>>,
-    }
-
-    struct SequenceBackend {
-        cleanup_called: AtomicBool,
-        queued_empty: AtomicBool,
-    }
-
-    impl InputBackend for SequenceBackend {
-        fn capabilities(&self) -> InputCapabilities {
-            InputCapabilities::default()
-        }
-
-        fn begin_sequence(&self) -> InputFuture<'_> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn emit(&self, _event: InputEvent) -> InputFuture<'_> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn queue_release(&self, held: Vec<HeldInput>) {
-            self.queued_empty.store(held.is_empty(), Ordering::Release);
-        }
-
-        fn cleanup_barrier(&self) -> InputFuture<'_> {
-            self.cleanup_called.store(true, Ordering::Release);
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    impl InputBackend for PendingReleaseBackend {
-        fn capabilities(&self) -> InputCapabilities {
-            InputCapabilities::default()
-        }
-
-        fn emit(&self, event: InputEvent) -> InputFuture<'_> {
-            Box::pin(async move {
-                match event {
-                    InputEvent::Keycode { pressed: false, .. } => future::pending().await,
-                    _ => Ok(()),
-                }
-            })
-        }
-
-        fn begin_sequence(&self) -> InputFuture<'_> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn queue_release(&self, held: Vec<HeldInput>) {
-            self.queued.lock().unwrap().extend(held);
-        }
-
-        fn cleanup_barrier(&self) -> InputFuture<'_> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
     #[tokio::test]
     async fn guard_releases_in_reverse_and_drop_covers_cancellation() {
-        let fake = FakeBackend::new(InputCapabilities::default());
+        let fake = FakeBackend::new();
         let backend: Arc<dyn InputBackend> = fake.clone();
         let mut guard = HeldInputGuard::new(backend);
         guard.press(HeldInput::Keycode(test_key(29))).await.unwrap();
@@ -323,9 +258,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_during_release_keeps_the_input_queued() {
-        let backend = Arc::new(PendingReleaseBackend {
-            queued: Mutex::new(Vec::new()),
-        });
+        let backend = FakeBackend::new();
+        backend.pending_releases.store(true, Ordering::Release);
         let mut guard = HeldInputGuard::new(backend.clone());
         guard.press(HeldInput::Keycode(test_key(10))).await.unwrap();
         assert!(
@@ -335,25 +269,33 @@ mod tests {
         );
         drop(guard);
         assert_eq!(
-            *backend.queued.lock().unwrap(),
+            *backend.emergency.lock().unwrap(),
             [HeldInput::Keycode(test_key(10))]
         );
     }
 
     #[tokio::test]
     async fn dropping_started_sequence_queues_cleanup_without_held_input() {
-        let backend = Arc::new(SequenceBackend {
-            cleanup_called: AtomicBool::new(false),
-            queued_empty: AtomicBool::new(false),
-        });
+        let backend = FakeBackend::new();
         let dynamic: Arc<dyn InputBackend> = backend.clone();
         let mut guard = HeldInputGuard::new(dynamic);
         guard.begin().await.unwrap();
         drop(guard);
 
-        assert!(backend.queued_empty.load(Ordering::Acquire));
+        assert_eq!(*backend.queue_calls.lock().unwrap(), [Vec::new()]);
         backend.cleanup_barrier().await.unwrap();
-        assert!(backend.cleanup_called.load(Ordering::Acquire));
+        assert_eq!(backend.cleanup_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_begin_still_queues_sequence_cleanup() {
+        let backend = FakeBackend::new();
+        backend.fail_begin.store(true, Ordering::Release);
+        let dynamic: Arc<dyn InputBackend> = backend.clone();
+        let mut guard = HeldInputGuard::new(dynamic);
+        assert_eq!(guard.begin().await.unwrap_err(), "fake begin failure");
+        drop(guard);
+        assert_eq!(*backend.queue_calls.lock().unwrap(), [Vec::new()]);
     }
 
     fn test_key(keycode: u32) -> KeyboardKey {

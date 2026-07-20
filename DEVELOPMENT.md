@@ -14,16 +14,9 @@ protocol, xkbcommon for the compositor-provided keymap, and rustix for
 `CLOCK_MONOTONIC`. Do not add portal `Notify*`, GStreamer, external
 screenshot tools, direct input devices, or compositor-specific paths.
 
-Native builds need a C/C++ toolchain, Clang and libclang, pkg-config, and the
-GLib/GIO, D-Bus, PipeWire, SPA, and libxkbcommon development files. CI uses Ubuntu 24.04
-and installs them with:
-
-```sh
-sudo apt-get update
-sudo apt-get install --no-install-recommends \
-  build-essential clang libclang-dev libdbus-1-dev libglib2.0-dev libpipewire-0.3-dev \
-  libspa-0.2-dev libxkbcommon-dev pkg-config
-```
+Native builds need the packages listed in the
+[README requirements](README.md#requirements). CI uses Ubuntu 24.04 and the same
+package set.
 
 The installed binary still needs the signed-in Wayland session's D-Bus, AT-SPI,
 PipeWire and SPA runtime, libxkbcommon, `xdg-desktop-portal`, and an EIS-capable
@@ -80,12 +73,13 @@ Do not automate live click, typing, or any other generated input.
 ## OpenCode MCP integration
 
 Follow the canonical Cargo installation, `init`, and OpenCode registration in
-[README.md](README.md#install-and-connect-opencode). The binary starts MCP only
+[README.md](README.md#install). The binary starts MCP only
 through the explicit `mcp` subcommand; no-argument launch prints CLI help.
 `doctor`, `list-apps`, and `snapshot APP` do not start a portal session.
-`call FILE` executes one JSON call object or array in one production runtime;
-use it for stateful direct testing without duplicating MCP validation or action
-logic.
+`call FILE` executes one JSON call object or static array in one production
+runtime without duplicating MCP validation or action logic. Static arrays cannot
+feed an opaque `state_id` returned by one entry into another; use MCP for
+observe-then-act testing.
 The MCP API has exactly six tools: `list_applications` (`running` or `installed`),
 `launch_application`, `observe`, `act_on_element`, `pointer`, and `keyboard`.
 Keep their closed schemas and action unions in `contract.rs` aligned with

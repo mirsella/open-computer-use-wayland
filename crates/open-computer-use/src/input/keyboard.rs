@@ -1,16 +1,9 @@
 use xkbcommon::xkb;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyToken {
-    pub name: String,
-    pub keysym: u32,
-    pub modifier: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyChord {
-    pub modifiers: Vec<KeyToken>,
-    pub key: KeyToken,
+    pub modifiers: Vec<u32>,
+    pub key: u32,
 }
 
 pub fn parse_chord(value: &str) -> Result<KeyChord, String> {
@@ -22,25 +15,29 @@ pub fn parse_chord(value: &str) -> Result<KeyChord, String> {
         .iter()
         .map(|part| parse_token(part))
         .collect::<Result<Vec<_>, _>>()?;
-    let key = tokens
+    let (key, key_is_modifier) = tokens
         .pop()
         .ok_or_else(|| "key chord is empty".to_owned())?;
-    if key.modifier {
+    if key_is_modifier {
         return Err("key chord must end with a non-modifier key".into());
     }
-    if let Some(token) = tokens.iter().find(|token| !token.modifier) {
+    if let Some((index, _)) = tokens
+        .iter()
+        .enumerate()
+        .find(|(_, (_, modifier))| !modifier)
+    {
         return Err(format!(
             "non-modifier key {:?} appears before the end of the chord",
-            token.name
+            parts[index]
         ));
     }
     Ok(KeyChord {
-        modifiers: tokens,
+        modifiers: tokens.into_iter().map(|(keysym, _)| keysym).collect(),
         key,
     })
 }
 
-pub fn unicode_token(character: char) -> Result<KeyToken, String> {
+pub fn unicode_keysym(character: char) -> Result<u32, String> {
     if character == '\0' {
         return Err("NUL text cannot be represented as keyboard input".into());
     }
@@ -51,14 +48,10 @@ pub fn unicode_token(character: char) -> Result<KeyToken, String> {
             u32::from(character)
         ));
     }
-    Ok(KeyToken {
-        name: character.to_string(),
-        keysym,
-        modifier: false,
-    })
+    Ok(keysym)
 }
 
-fn parse_token(value: &str) -> Result<KeyToken, String> {
+fn parse_token(value: &str) -> Result<(u32, bool), String> {
     let normalized = value.to_ascii_lowercase();
     let (xkb_name, modifier) = match normalized.as_str() {
         "ctrl" | "control" => ("Control_L", true),
@@ -104,8 +97,9 @@ fn parse_token(value: &str) -> Result<KeyToken, String> {
             };
             if characters.next().is_none() {
                 // Chord key names are case-insensitive. Literal text preserves case through
-                // `unicode_token` directly and must request Shift when the keymap requires it.
-                return unicode_token(character.to_ascii_lowercase());
+                // `unicode_keysym` directly and must request Shift when the keymap requires it.
+                return unicode_keysym(character.to_ascii_lowercase())
+                    .map(|keysym| (keysym, false));
             }
             return Err(format!("unknown key name {value:?}"));
         }
@@ -114,11 +108,7 @@ fn parse_token(value: &str) -> Result<KeyToken, String> {
     if keysym == 0 {
         return Err(format!("XKB does not recognize key name {xkb_name:?}"));
     }
-    Ok(KeyToken {
-        name: value.to_owned(),
-        keysym,
-        modifier,
-    })
+    Ok((keysym, modifier))
 }
 
 fn function_key(name: &str) -> Option<&'static str> {
@@ -146,14 +136,11 @@ mod tests {
     #[test]
     fn parses_aliases_keypad_and_modifier_order() {
         let chord = parse_chord("alt+Control+KP_0").unwrap();
-        assert_eq!(chord.modifiers[0].keysym, xkb::Keysym::Alt_L.raw());
-        assert_eq!(chord.modifiers[1].keysym, xkb::Keysym::Control_L.raw());
-        assert_eq!(chord.key.keysym, xkb::Keysym::KP_0.raw());
+        assert_eq!(chord.modifiers[0], xkb::Keysym::Alt_L.raw());
+        assert_eq!(chord.modifiers[1], xkb::Keysym::Control_L.raw());
+        assert_eq!(chord.key, xkb::Keysym::KP_0.raw());
         assert!(parse_chord("ctrl+wat").unwrap_err().contains("unknown"));
-        assert_eq!(
-            parse_chord("Ctrl+L").unwrap().key.keysym,
-            xkb::Keysym::l.raw()
-        );
+        assert_eq!(parse_chord("Ctrl+L").unwrap().key, xkb::Keysym::l.raw());
         assert!(parse_chord("a+ctrl").is_err());
         for name in [
             "Return",
@@ -178,8 +165,8 @@ mod tests {
 
     #[test]
     fn unicode_tokens_are_xkb_keysyms() {
-        assert_ne!(unicode_token('é').unwrap().keysym, 0);
-        assert_ne!(unicode_token('🙂').unwrap().keysym, 0);
-        assert!(unicode_token('\0').is_err());
+        assert_ne!(unicode_keysym('é').unwrap(), 0);
+        assert_ne!(unicode_keysym('🙂').unwrap(), 0);
+        assert!(unicode_keysym('\0').is_err());
     }
 }

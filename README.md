@@ -106,7 +106,7 @@ open-computer-use mcp
 ```
 
 `doctor`, `list-apps`, and `snapshot` do not open a portal chooser. `call`
-accepts one JSON call or an array and keeps state between calls:
+accepts one JSON call or a static array and keeps one runtime for that batch:
 
 ```json
 [
@@ -115,8 +115,9 @@ accepts one JSON call or an array and keeps state between calls:
 ]
 ```
 
-Use the returned `state_id` in a later `act_on_element`, `pointer`, or
-`keyboard` call.
+Static arrays cannot insert an opaque `state_id` returned by an earlier entry.
+Use MCP for observe-then-act workflows. Direct arrays are suitable for calls
+that do not depend on earlier output.
 
 ## Security and support
 

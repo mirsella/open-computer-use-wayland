@@ -117,6 +117,38 @@ fn parses_nested_discriminated_actions_and_defaults() {
 
 #[test]
 fn validates_numbers_and_bounded_counts() {
+    assert_eq!(
+        valid(
+            "observe",
+            json!({"target": "Editor", "text_limit": 12.0, "max_tree_nodes": 12.0, "max_tree_depth": 3.0})
+        ),
+        ToolCall::Observe {
+            target: "Editor".into(),
+            text_limit: Some(TextLimit::Count(12)),
+            max_tree_nodes: Some(12),
+            max_tree_depth: Some(3),
+        }
+    );
+    assert_eq!(
+        pointer_action(json!({"type": "click", "x": 1, "y": 2, "count": 2.0})),
+        PointerAction::Click {
+            x: 1.0,
+            y: 2.0,
+            button: MouseButton::Left,
+            count: 2,
+        }
+    );
+    assert_eq!(
+        pointer_action(
+            json!({"type": "scroll", "x": 1, "y": 2, "direction": "down", "steps": 2.0})
+        ),
+        PointerAction::Scroll {
+            x: 1.0,
+            y: 2.0,
+            delta_x: 0,
+            delta_y: 240,
+        }
+    );
     for arguments in [
         json!({"state_id": STATE_ID, "action": {"type": "move", "x": "1", "y": 2}}),
         json!({"state_id": STATE_ID, "action": {"type": "drag", "from_x": 1, "from_y": null, "to_x": 3, "to_y": 4}}),

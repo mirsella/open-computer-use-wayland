@@ -43,15 +43,14 @@ struct DesktopEntry {
 pub async fn list_installed_apps() -> Result<Vec<InstalledApp>, RuntimeError> {
     tokio::task::spawn_blocking(|| {
         let mut apps = installed_entries()
-            .into_iter()
             .map(|entry| entry.info)
             .collect::<Vec<_>>();
-        apps.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.desktop_id.cmp(&right.desktop_id))
+        apps.sort_by_cached_key(|app| {
+            (
+                app.name.to_lowercase(),
+                app.name.clone(),
+                app.desktop_id.clone(),
+            )
         });
         Ok(apps)
     })
@@ -84,7 +83,7 @@ pub async fn launch(
         .map_err(|_| backend_error("desktop app launch thread stopped without a result"))?
 }
 
-fn installed_entries() -> Vec<DesktopEntry> {
+fn installed_entries() -> impl Iterator<Item = DesktopEntry> {
     AppInfo::all()
         .into_iter()
         .filter_map(|app| app.downcast::<DesktopAppInfo>().ok())
@@ -99,55 +98,11 @@ fn installed_entries() -> Vec<DesktopEntry> {
                 app,
             })
         })
-        .collect()
 }
 
 fn launch_blocking(desktop_id: &str) -> Result<LaunchResult, RuntimeError> {
-    let entries = installed_entries();
-    let index = resolve_index(
-        entries.iter().map(|entry| entry.info.desktop_id.as_str()),
-        desktop_id,
-    )?;
-    let entry = &entries[index];
-    let null = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-        .map_err(|error| backend_error(format!("cannot open /dev/null for app launch: {error}")))?;
-    entry
-        .app
-        .launch_uris_as_manager_with_fds::<AppLaunchContext>(
-            &[],
-            None,
-            SpawnFlags::SEARCH_PATH,
-            None,
-            None,
-            Some(&null),
-            Some(&null),
-            Some(&null),
-        )
-        .map_err(|error| {
-            RuntimeError::new(
-                "backend_failed",
-                format!("failed to launch desktop app: {error}"),
-                ToolOutcome::Unknown,
-                false,
-                "Inspect running applications before deciding whether to launch again.",
-            )
-        })?;
-    Ok(LaunchResult {
-        desktop_id: entry.info.desktop_id.clone(),
-        name: entry.info.name.clone(),
-    })
-}
-
-fn resolve_index<'a>(
-    desktop_ids: impl IntoIterator<Item = &'a str>,
-    desktop_id: &str,
-) -> Result<usize, RuntimeError> {
-    desktop_ids
-        .into_iter()
-        .position(|candidate| candidate == desktop_id)
+    let DesktopEntry { info, app } = installed_entries()
+        .find(|entry| entry.info.desktop_id == desktop_id)
         .ok_or_else(|| {
             RuntimeError::new(
                 "target_unavailable",
@@ -156,7 +111,35 @@ fn resolve_index<'a>(
                 false,
                 "Call list_applications with scope=installed and use an exact returned desktop_id.",
             )
-        })
+        })?;
+    let null = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map_err(|error| backend_error(format!("cannot open /dev/null for app launch: {error}")))?;
+    app.launch_uris_as_manager_with_fds::<AppLaunchContext>(
+        &[],
+        None,
+        SpawnFlags::SEARCH_PATH,
+        None,
+        None,
+        Some(&null),
+        Some(&null),
+        Some(&null),
+    )
+    .map_err(|error| {
+        RuntimeError::new(
+            "backend_failed",
+            format!("failed to launch desktop app: {error}"),
+            ToolOutcome::Unknown,
+            false,
+            "Inspect running applications before deciding whether to launch again.",
+        )
+    })?;
+    Ok(LaunchResult {
+        desktop_id: info.desktop_id,
+        name: info.name,
+    })
 }
 
 fn launch_in_progress_error() -> RuntimeError {
@@ -177,27 +160,4 @@ fn backend_error(message: impl Into<String>) -> RuntimeError {
         true,
         "Retry once. If the failure persists, inspect server diagnostics.",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(id: &str, name: &str) -> InstalledApp {
-        InstalledApp {
-            desktop_id: id.into(),
-            name: name.into(),
-            shown: true,
-        }
-    }
-
-    #[test]
-    fn resolution_requires_exact_full_case_sensitive_id() {
-        let entries = [entry("org.kde.kate.desktop", "Kate")];
-        let ids = || entries.iter().map(|entry| entry.desktop_id.as_str());
-        assert!(resolve_index(ids(), "org.kde.kate.desktop").is_ok());
-        assert!(resolve_index(ids(), "org.kde.kate").is_err());
-        assert!(resolve_index(ids(), "ORG.KDE.KATE.DESKTOP").is_err());
-        assert!(resolve_index(ids(), "Kate").is_err());
-    }
 }

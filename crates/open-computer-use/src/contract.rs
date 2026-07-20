@@ -29,6 +29,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 &["scope"],
             ),
             true,
+            false,
         ),
         tool(
             "launch_application",
@@ -38,6 +39,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 &["desktop_id"],
             ),
             false,
+            true,
         ),
         tool(
             "observe",
@@ -51,7 +53,8 @@ pub fn tool_definitions() -> Vec<Tool> {
                 }),
                 &["target"],
             ),
-            true,
+            false,
+            false,
         ),
         tool(
             "act_on_element",
@@ -70,6 +73,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 &["state_id", "element_id", "action"],
             ),
             false,
+            true,
         ),
         tool(
             "pointer",
@@ -93,6 +97,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 &["state_id", "action"],
             ),
             false,
+            true,
         ),
         tool(
             "keyboard",
@@ -109,17 +114,26 @@ pub fn tool_definitions() -> Vec<Tool> {
                 &["state_id", "focus", "action"],
             ),
             false,
+            true,
         ),
     ]
 }
 
-fn tool(name: &'static str, description: &'static str, schema: Value, read_only: bool) -> Tool {
+fn tool(
+    name: &'static str,
+    description: &'static str,
+    schema: Value,
+    read_only: bool,
+    destructive: bool,
+) -> Tool {
     let mut annotations = ToolAnnotations::new().read_only(read_only).open_world(true);
-    if !read_only {
+    if destructive {
         annotations = annotations.destructive(true).idempotent(false);
+    } else if !read_only {
+        annotations = annotations.destructive(false).idempotent(false);
     }
-    Tool::new(name, description, Arc::new(as_object(schema)))
-        .with_raw_output_schema(Arc::new(as_object(output_schema(name))))
+    Tool::new(name, description, Arc::new(into_object(schema)))
+        .with_raw_output_schema(Arc::new(into_object(output_schema(name))))
         .annotate(annotations)
 }
 
@@ -185,21 +199,19 @@ fn state_id() -> Value {
 }
 
 fn coordinates(names: &[&str]) -> Value {
-    let mut properties = JsonObject::new();
-    for name in names {
-        properties.insert((*name).to_owned(), json!({"type": "number", "minimum": 0}));
-    }
+    let properties = names
+        .iter()
+        .map(|name| ((*name).to_owned(), json!({"type": "number", "minimum": 0})))
+        .collect();
     Value::Object(properties)
 }
 
 fn action_object(kind: &str, properties: Value, required: &[&str]) -> Value {
-    let mut properties = as_object(properties);
+    let mut properties = into_object(properties);
     properties.insert("type".into(), json!({"const": kind}));
-    let mut required = required
-        .iter()
-        .map(|value| json!(value))
+    let required = std::iter::once("type")
+        .chain(required.iter().copied())
         .collect::<Vec<_>>();
-    required.insert(0, json!("type"));
     json!({
         "type": "object",
         "properties": properties,
@@ -211,21 +223,21 @@ fn action_object(kind: &str, properties: Value, required: &[&str]) -> Value {
 fn object(properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "object",
-        "properties": as_object(properties),
+        "properties": into_object(properties),
         "required": required,
         "additionalProperties": false
     })
 }
 
 fn merge(left: Value, right: Value) -> Value {
-    let mut merged = as_object(left);
-    merged.extend(as_object(right));
+    let mut merged = into_object(left);
+    merged.extend(into_object(right));
     Value::Object(merged)
 }
 
-fn as_object(value: Value) -> JsonObject<String, Value> {
-    value
-        .as_object()
-        .cloned()
-        .expect("schema helper requires an object")
+fn into_object(value: Value) -> JsonObject<String, Value> {
+    match value {
+        Value::Object(object) => object,
+        _ => panic!("schema helper requires an object"),
+    }
 }

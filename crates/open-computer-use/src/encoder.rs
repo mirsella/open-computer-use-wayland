@@ -13,45 +13,32 @@ const MAX_DOWNSCALE_ATTEMPTS: usize = 10;
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodedPng {
     pub bytes: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
+    pub mapping: PngMapping,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PngMapping {
+    pub size: (u32, u32),
     pub png_to_transformed_x: f64,
     pub png_to_transformed_y: f64,
 }
 
-pub trait ScreenshotEncoder: Send + Sync + 'static {
-    fn encode(
-        &self,
-        rgba: Vec<u8>,
-        frame_size: (u32, u32),
-        valid_crop: PixelRect,
-        transform: Transform,
-        output_crop: PixelRect,
-    ) -> Result<EncodedPng, String>;
-}
-
-#[derive(Debug, Default)]
-pub struct PngScreenshotEncoder;
-
-impl ScreenshotEncoder for PngScreenshotEncoder {
-    fn encode(
-        &self,
-        rgba: Vec<u8>,
-        frame_size: (u32, u32),
-        valid_crop: PixelRect,
-        transform: Transform,
-        output_crop: PixelRect,
-    ) -> Result<EncodedPng, String> {
-        encode_with_limits(
-            rgba,
-            frame_size,
-            valid_crop,
-            transform,
-            output_crop,
-            MAX_LONGEST_DIMENSION,
-            MAX_PNG_BYTES,
-        )
-    }
+pub fn encode(
+    rgba: Vec<u8>,
+    frame_size: (u32, u32),
+    valid_crop: PixelRect,
+    transform: Transform,
+    output_crop: PixelRect,
+) -> Result<EncodedPng, String> {
+    encode_with_limits(
+        rgba,
+        frame_size,
+        valid_crop,
+        transform,
+        output_crop,
+        MAX_LONGEST_DIMENSION,
+        MAX_PNG_BYTES,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -76,10 +63,11 @@ pub(crate) fn encode_with_limits(
         if bytes.len() <= maximum_bytes {
             return Ok(EncodedPng {
                 bytes,
-                width: image.width(),
-                height: image.height(),
-                png_to_transformed_x: f64::from(output_crop.width) / f64::from(image.width()),
-                png_to_transformed_y: f64::from(output_crop.height) / f64::from(image.height()),
+                mapping: PngMapping {
+                    size: (image.width(), image.height()),
+                    png_to_transformed_x: f64::from(output_crop.width) / f64::from(image.width()),
+                    png_to_transformed_y: f64::from(output_crop.height) / f64::from(image.height()),
+                },
             });
         }
         if image.width() == 1 && image.height() == 1 {
@@ -97,13 +85,7 @@ pub(crate) fn encode_with_limits(
 }
 
 fn checked_crop(image: &RgbaImage, crop: PixelRect) -> Result<RgbaImage, String> {
-    let right = crop
-        .right()
-        .ok_or_else(|| "pixel crop overflow".to_owned())?;
-    let bottom = crop
-        .bottom()
-        .ok_or_else(|| "pixel crop overflow".to_owned())?;
-    if crop.width == 0 || crop.height == 0 || right > image.width() || bottom > image.height() {
+    if !crop.is_valid_within((image.width(), image.height())) {
         return Err("pixel crop is outside the image".into());
     }
     Ok(imageops::crop_imm(image, crop.x, crop.y, crop.width, crop.height).to_image())
@@ -179,7 +161,7 @@ mod tests {
             9_000,
         )
         .unwrap();
-        assert!(encoded.width.max(encoded.height) <= 128);
+        assert!(encoded.mapping.size.0.max(encoded.mapping.size.1) <= 128);
         assert!(encoded.bytes.len() <= 9_000);
         assert_eq!(&encoded.bytes[..8], b"\x89PNG\r\n\x1a\n");
     }

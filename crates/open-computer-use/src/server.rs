@@ -25,14 +25,14 @@ use crate::{
 pub struct OpenComputerUseServer<R = SemanticRuntime<AtspiAdapter, ProductionScreenshotCoordinator>>
 {
     runtime: R,
-    mutation: tokio::sync::Mutex<()>,
+    execution_barrier: tokio::sync::Mutex<()>,
 }
 
 impl<R> OpenComputerUseServer<R> {
     pub fn new(runtime: R) -> Self {
         Self {
             runtime,
-            mutation: tokio::sync::Mutex::new(()),
+            execution_barrier: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -71,64 +71,62 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let arguments = request.arguments.unwrap_or_default();
-        let structured = context.protocol_version().is_some_and(|version| {
-            version == ProtocolVersion::V_2025_06_18
-                || version == ProtocolVersion::V_2025_11_25
-                || version == ProtocolVersion::V_2026_07_28
-        });
         let call = match validate_call(&request.name, arguments) {
             Ok(call) => call,
             Err(error) => return Err(McpError::invalid_params(error.to_string(), None)),
         };
-        let _mutation = if call.is_mutating() {
-            Some(self.mutation.lock().await)
-        } else {
-            None
-        };
-        if context.ct.is_cancelled() {
+        let _execution = self.execution_barrier.lock().await;
+        let result = if context.ct.is_cancelled() {
             eprintln!("open-computer-use: queued tool call cancelled before execution");
-            return Ok(for_protocol(
-                tool_error_result(&RuntimeError::new(
-                    "cancelled",
-                    "tool call cancelled before execution",
-                    ToolOutcome::NotStarted,
-                    true,
-                    "Retry the call if it is still needed.",
-                )),
-                structured,
-            ));
-        }
-        let runtime_result = tokio::select! {
-            result = self.runtime.execute(call) => result,
-            () = context.ct.cancelled() => {
-                eprintln!("open-computer-use: tool call cancelled");
-                match tokio::time::timeout(Duration::from_secs(2), self.runtime.cleanup()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!("open-computer-use: cancellation cleanup failed: {error}"),
-                    Err(_) => {
-                        eprintln!("open-computer-use: cancellation cleanup timed out; shutting down the desktop session");
-                        if let Err(error) = self.runtime.shutdown().await {
-                            eprintln!("open-computer-use: cancellation shutdown failed: {error}");
+            tool_error_result(&RuntimeError::new(
+                "cancelled",
+                "tool call cancelled before execution",
+                ToolOutcome::NotStarted,
+                true,
+                "Retry the call if it is still needed.",
+            ))
+        } else {
+            tokio::select! {
+                result = self.runtime.execute(call) => match result {
+                    Ok(output) => output.into_mcp_result(),
+                    Err(error) => {
+                        eprintln!("open-computer-use: {error}");
+                        tool_error_result(&error)
+                    }
+                },
+                () = context.ct.cancelled() => {
+                    eprintln!("open-computer-use: tool call cancelled");
+                    match tokio::time::timeout(Duration::from_secs(2), self.runtime.cleanup()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("open-computer-use: cancellation cleanup failed: {error}; shutting down the desktop session");
+                            shutdown_after_cleanup_failure(&self.runtime).await;
+                        }
+                        Err(_) => {
+                            eprintln!("open-computer-use: cancellation cleanup timed out; shutting down the desktop session");
+                            shutdown_after_cleanup_failure(&self.runtime).await;
                         }
                     }
+                    let error = RuntimeError::new(
+                        "cancelled",
+                        "tool call cancelled while execution was active",
+                        ToolOutcome::Unknown,
+                        false,
+                        "Call observe and inspect current state before deciding whether another action is needed.",
+                    );
+                    tool_error_result(&error)
                 }
-                let error = RuntimeError::new(
-                    "cancelled",
-                    "tool call cancelled while execution was active",
-                    ToolOutcome::Unknown,
-                    false,
-                    "Call observe and inspect current state before deciding whether another action is needed.",
-                );
-                return Ok(for_protocol(tool_error_result(&error), structured));
             }
         };
-        match runtime_result {
-            Ok(output) => Ok(for_protocol(output.into_mcp_result(), structured)),
-            Err(error) => {
-                eprintln!("open-computer-use: {error}");
-                Ok(for_protocol(tool_error_result(&error), structured))
-            }
-        }
+        Ok(for_protocol(result, supports_structured_content(&context)))
+    }
+}
+
+async fn shutdown_after_cleanup_failure<R: DesktopRuntime>(runtime: &R) {
+    match tokio::time::timeout(Duration::from_secs(2), runtime.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("open-computer-use: cancellation shutdown failed: {error}"),
+        Err(_) => eprintln!("open-computer-use: cancellation shutdown timed out"),
     }
 }
 
@@ -171,4 +169,12 @@ fn for_protocol(mut result: CallToolResult, structured: bool) -> CallToolResult 
         result.structured_content = None;
     }
     result
+}
+
+fn supports_structured_content(context: &RequestContext<RoleServer>) -> bool {
+    context.protocol_version().is_some_and(|version| {
+        version == ProtocolVersion::V_2025_06_18
+            || version == ProtocolVersion::V_2025_11_25
+            || version == ProtocolVersion::V_2026_07_28
+    })
 }

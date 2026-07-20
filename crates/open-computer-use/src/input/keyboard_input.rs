@@ -5,7 +5,7 @@ use tokio::time::sleep;
 use super::{
     backend::{HeldInput, HeldInputGuard, InputBackend, InputEvent, KeyboardKey},
     eis::{ReisInputBackend, ResolvedKey},
-    keyboard::{KeyChord, parse_chord, unicode_token},
+    keyboard::{KeyChord, parse_chord, unicode_keysym},
     pointer::button_code,
 };
 use crate::validation::MouseButton;
@@ -28,11 +28,10 @@ pub async fn type_text(
     focus: (f64, f64),
     text: &str,
 ) -> Result<(), String> {
-    let tokens = text
+    let keysyms = text
         .chars()
-        .map(unicode_token)
+        .map(unicode_keysym)
         .collect::<Result<Vec<_>, _>>()?;
-    let keysyms = tokens.iter().map(|token| token.keysym).collect::<Vec<_>>();
     resolve_text(&backend, &keysyms)?;
     let resolver = Arc::clone(&backend);
     focused_tap_sequence(backend, focus, move || resolve_text(&resolver, &keysyms)).await
@@ -45,8 +44,8 @@ fn resolve_chord(
     let keysyms = chord
         .modifiers
         .iter()
-        .map(|token| token.keysym)
-        .chain(std::iter::once(chord.key.keysym))
+        .copied()
+        .chain(std::iter::once(chord.key))
         .collect::<Vec<_>>();
     let mut resolved = backend.resolve_keysyms(&keysyms)?;
     let key = resolved.pop().ok_or("key chord is empty")?;
@@ -142,17 +141,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
-    use crate::input::backend::{InputCapabilities, test_support::FakeBackend};
+    use crate::input::backend::test_support::FakeBackend;
 
     #[tokio::test(start_paused = true)]
     async fn keyboard_sequence_focuses_the_visible_point_before_typing() {
-        let backend = FakeBackend::new(InputCapabilities {
-            absolute_pointer: true,
-            button: true,
-            keyboard: true,
-            ..Default::default()
-        });
+        let backend = FakeBackend::new();
 
         let modifier = KeyboardKey {
             device_id: 7,
@@ -163,11 +159,30 @@ mod tests {
             keycode: 30,
             ..modifier
         };
-        focused_tap_sequence(Arc::clone(&backend), (125.5, 80.25), || {
+        let resolved_after_focus = Arc::new(AtomicBool::new(false));
+        let observed_backend = Arc::clone(&backend);
+        let observed_resolution = Arc::clone(&resolved_after_focus);
+        focused_tap_sequence(Arc::clone(&backend), (125.5, 80.25), move || {
+            observed_resolution.store(
+                observed_backend.events.lock().unwrap().as_slice()
+                    == [
+                        InputEvent::Absolute { x: 125.5, y: 80.25 },
+                        InputEvent::Button {
+                            code: 272,
+                            pressed: true,
+                        },
+                        InputEvent::Button {
+                            code: 272,
+                            pressed: false,
+                        },
+                    ],
+                Ordering::Release,
+            );
             Ok(vec![(vec![modifier], key)])
         })
         .await
         .unwrap();
+        assert!(resolved_after_focus.load(Ordering::Acquire));
 
         assert_eq!(
             *backend.events.lock().unwrap(),

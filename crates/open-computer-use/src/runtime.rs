@@ -1,31 +1,31 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, sync::Arc};
 
 use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::{errors::RuntimeError, validation::ToolCall};
 
-pub type RuntimeFuture<'a, T = ToolOutput> =
-    Pin<Box<dyn Future<Output = Result<T, RuntimeError>> + Send + 'a>>;
-
 pub trait DesktopRuntime: Send + Sync + 'static {
-    fn execute(&self, call: ToolCall) -> RuntimeFuture<'_>;
-    fn cleanup(&self) -> RuntimeFuture<'_, ()>;
-    fn shutdown(&self) -> RuntimeFuture<'_, ()> {
-        self.cleanup()
+    fn execute(
+        &self,
+        call: ToolCall,
+    ) -> impl Future<Output = Result<ToolOutput, RuntimeError>> + Send + '_;
+    fn cleanup(&self) -> impl Future<Output = Result<(), RuntimeError>> + Send + '_;
+    fn shutdown(&self) -> impl Future<Output = Result<(), RuntimeError>> + Send + '_ {
+        async move { self.cleanup().await }
     }
 }
 
 impl<R: DesktopRuntime> DesktopRuntime for Arc<R> {
-    fn execute(&self, call: ToolCall) -> RuntimeFuture<'_> {
-        (**self).execute(call)
+    async fn execute(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
+        (**self).execute(call).await
     }
 
-    fn cleanup(&self) -> RuntimeFuture<'_, ()> {
-        (**self).cleanup()
+    async fn cleanup(&self) -> Result<(), RuntimeError> {
+        (**self).cleanup().await
     }
 
-    fn shutdown(&self) -> RuntimeFuture<'_, ()> {
-        (**self).shutdown()
+    async fn shutdown(&self) -> Result<(), RuntimeError> {
+        (**self).shutdown().await
     }
 }
 

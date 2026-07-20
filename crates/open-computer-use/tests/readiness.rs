@@ -11,7 +11,7 @@ use image::{ColorType, GenericImageView, ImageEncoder, ImageFormat, codecs::png:
 use open_computer_use::{
     contract::TOOL_NAMES,
     errors::{RuntimeError, ToolOutcome},
-    runtime::{DesktopRuntime, RuntimeFuture, ToolOutput},
+    runtime::{DesktopRuntime, ToolOutput},
     server::OpenComputerUseServer,
     validation::{
         ApplicationScope, ElementAction, KeyboardAction, MouseButton, PointerAction, TextLimit,
@@ -65,7 +65,10 @@ impl FakeRuntime {
 }
 
 impl DesktopRuntime for FakeRuntime {
-    fn execute(&self, call: ToolCall) -> RuntimeFuture<'_> {
+    fn execute(
+        &self,
+        call: ToolCall,
+    ) -> impl std::future::Future<Output = Result<ToolOutput, RuntimeError>> + Send + '_ {
         self.state
             .calls
             .lock()
@@ -74,7 +77,7 @@ impl DesktopRuntime for FakeRuntime {
         let fail = self.state.fail_next.swap(false, Ordering::AcqRel);
         let png_base64 =
             matches!(call, ToolCall::Observe { .. }).then(|| self.state.png_base64.clone());
-        Box::pin(async move {
+        async move {
             if fail {
                 return Err(RuntimeError::new(
                     "fake_runtime_unavailable",
@@ -84,21 +87,22 @@ impl DesktopRuntime for FakeRuntime {
                     "Call observe for current state, then retry only if the requested action is still needed.",
                 ));
             }
-            let output = ToolOutput::text("fake runtime success");
+            let output = ToolOutput::text("fake runtime success")
+                .with_structured_content(json!({"status": "fake"}));
             Ok(match png_base64 {
                 Some(png_base64) => output.with_png_base64(png_base64),
                 None => output,
             })
-        })
+        }
     }
 
-    fn cleanup(&self) -> RuntimeFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+    async fn cleanup(&self) -> Result<(), RuntimeError> {
+        Ok(())
     }
 
-    fn shutdown(&self) -> RuntimeFuture<'_, ()> {
+    fn shutdown(&self) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send + '_ {
         self.state.shutdowns.fetch_add(1, Ordering::AcqRel);
-        Box::pin(async { Ok(()) })
+        async { Ok(()) }
     }
 }
 
@@ -252,13 +256,18 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
 }
 
 #[tokio::test]
-async fn runtime_error_shape_is_gated_by_protocol_version() {
+async fn structured_content_is_gated_by_protocol_version_at_one_return_point() {
     for (protocol_version, expects_structured_content) in [
         ("2024-11-05", false),
         ("2025-03-26", false),
         ("2025-11-25", true),
     ] {
-        let response = runtime_error_for_protocol(protocol_version).await;
+        let (success, response) = results_for_protocol(protocol_version).await;
+        assert_eq!(
+            success["result"].get("structuredContent"),
+            expects_structured_content.then_some(&json!({"status": "fake"})),
+            "successful result for protocol {protocol_version}"
+        );
         let result = &response["result"];
         let text = result["content"][0]["text"]
             .as_str()
@@ -284,7 +293,7 @@ async fn runtime_error_shape_is_gated_by_protocol_version() {
     }
 }
 
-async fn runtime_error_for_protocol(protocol_version: &str) -> Value {
+async fn results_for_protocol(protocol_version: &str) -> (Value, Value) {
     let runtime = FakeRuntime::new(STANDARD.encode(test_png()));
     let server_runtime = runtime.clone();
     let (server_transport, client_transport) = tokio::io::duplex(8 * 1024);
@@ -326,7 +335,6 @@ async fn runtime_error_for_protocol(protocol_version: &str) -> Value {
         .await
         .expect("send initialized notification");
 
-    runtime.fail_next();
     client
         .send(message(json!({
             "jsonrpc": "2.0",
@@ -335,9 +343,22 @@ async fn runtime_error_for_protocol(protocol_version: &str) -> Value {
             "params": {"name": "list_applications", "arguments": {"scope": "running"}},
         })))
         .await
+        .expect("send successful runtime call");
+    let success = response_value(client.receive().await.expect("runtime success response"));
+    assert_eq!(success["id"], 2);
+
+    runtime.fail_next();
+    client
+        .send(message(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "list_applications", "arguments": {"scope": "running"}},
+        })))
+        .await
         .expect("send runtime failure call");
     let response = response_value(client.receive().await.expect("runtime error response"));
-    assert_eq!(response["id"], 2);
+    assert_eq!(response["id"], 3);
 
     drop(client);
     tokio::time::timeout(Duration::from_secs(2), server)
@@ -345,7 +366,7 @@ async fn runtime_error_for_protocol(protocol_version: &str) -> Value {
         .expect("server should stop when the transport closes")
         .expect("join server");
     assert_eq!(runtime.shutdowns(), 1);
-    response
+    (success, response)
 }
 
 fn runtime_error_structured_content() -> Value {
@@ -500,6 +521,11 @@ fn assert_success(response: &Value, name: &str) {
     assert_eq!(
         response["result"]["content"][0],
         json!({"type": "text", "text": "fake runtime success"}),
+        "{name}: {response}"
+    );
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({"status": "fake"}),
         "{name}: {response}"
     );
 }
