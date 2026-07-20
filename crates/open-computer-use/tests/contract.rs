@@ -155,7 +155,7 @@ fn expected_schemas() -> Vec<Value> {
             json!({
                 "state_id": state_id(),
                 "element_id": {"anyOf": [{"type": "string", "pattern": "^(?:[0-9]{1,3}|[0-4][0-9]{3})$"}, {"type": "integer", "minimum": 0, "maximum": 4_999}]},
-                "action": {"oneOf": [
+                "action": {"description": "Object, never a string. Use {\"type\":\"invoke\"}, {\"type\":\"focus\"}, {\"type\":\"named\",\"name\":\"...\"}, or {\"type\":\"set_value\",\"value\":\"...\"}.", "oneOf": [
                     action("invoke", json!({}), &[]),
                     action("focus", json!({}), &[]),
                     action("named", json!({"name": {"type": "string", "pattern": ".*\\S.*"}}), &["name"]),
@@ -167,7 +167,7 @@ fn expected_schemas() -> Vec<Value> {
         object(
             json!({
                 "state_id": state_id(),
-                "action": {"oneOf": [
+                "action": {"description": "Object with type move, click, drag, or scroll.", "oneOf": [
                     action("move", coordinates(&["x", "y"]), &["x", "y"]),
                     action("click", merge(coordinates(&["x", "y"]), json!({"button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}})), &["x", "y"]),
                     action("drag", coordinates(&["from_x", "from_y", "to_x", "to_y"]), &["from_x", "from_y", "to_x", "to_y"]),
@@ -180,7 +180,7 @@ fn expected_schemas() -> Vec<Value> {
             json!({
                 "state_id": state_id(),
                 "focus": object(coordinates(&["x", "y"]), &["x", "y"]),
-                "action": {"oneOf": [
+                "action": {"description": "Object: {\"type\":\"press\",\"key\":\"Ctrl+L\"} or {\"type\":\"type\",\"text\":\"...\"}.", "oneOf": [
                     action("press", json!({"key": {"type": "string", "pattern": "^(?!(?=.*(?:^|\\+)\\s*[Aa][Ll][Tt]\\s*(?:\\+|$))(?=.*(?:^|\\+)\\s*[Tt][Aa][Bb]\\s*(?:\\+|$))).*\\S.*$", "description": "Examples: Ctrl+L, Enter, F5, é. Chords containing both Alt and Tab are rejected."}}), &["key"]),
                     action("type", json!({"text": {"type": "string"}}), &["text"]),
                 ]},

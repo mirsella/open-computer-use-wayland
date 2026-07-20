@@ -274,6 +274,13 @@ fn converts_scroll_directions_to_wheel_deltas() {
 fn rejects_unknown_fields_in_nested_objects() {
     assert!(
         invalid(
+            "act_on_element",
+            json!({"state_id": STATE_ID, "element_id": 1, "action": "focus"}),
+        )
+        .contains("argument \"action\" must be an object")
+    );
+    assert!(
+        invalid(
             "pointer",
             json!({"state_id": STATE_ID, "action": {"type": "move", "x": 1, "y": 2, "extra": true}})
         )

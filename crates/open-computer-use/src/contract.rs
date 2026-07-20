@@ -17,7 +17,7 @@ pub const TOOL_NAMES: [&str; 6] = [
     "keyboard",
 ];
 
-pub const SERVER_INSTRUCTIONS: &str = "Use `list_applications` to discover running targets or exact installed desktop IDs. Use `observe` before acting; it returns an opaque `state_id`, current AT-SPI state, and the full approved-monitor PNG. Every element, pointer, and keyboard action requires that exact `state_id`; stale state is rejected and successful actions return a new observation. Element actions use AT-SPI. Pointer and keyboard coordinates use `screenshot_png_pixels`, never AT-SPI frames. Keyboard actions first left-click `focus`; choose a visible point inside the target app. If the target is not visibly reachable, stop instead of using a desktop focus-switch shortcut.";
+pub const SERVER_INSTRUCTIONS: &str = "Use `list_applications` to discover running targets or exact installed desktop IDs. Use `observe` before acting; it returns an opaque `state_id`, current AT-SPI state, and the full approved-monitor PNG. Every element, pointer, and keyboard action requires that exact `state_id`; stale state is rejected and successful actions return a new observation. Every `action` argument is an object with a required `type` field, never a string. Element actions use AT-SPI. Pointer and keyboard coordinates use `screenshot_png_pixels`, never AT-SPI frames. Keyboard actions first left-click `focus`; choose a visible point inside the target app. If the target is not visibly reachable, stop instead of using a desktop focus-switch shortcut.";
 
 pub fn tool_definitions() -> Vec<Tool> {
     vec![
@@ -63,7 +63,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 json!({
                     "state_id": state_id(),
                     "element_id": {"anyOf": [{"type": "string", "pattern": "^(?:[0-9]{1,3}|[0-4][0-9]{3})$"}, {"type": "integer", "minimum": 0, "maximum": MAX_ELEMENT_ID}]},
-                    "action": {"oneOf": [
+                    "action": {"description": "Object, never a string. Use {\"type\":\"invoke\"}, {\"type\":\"focus\"}, {\"type\":\"named\",\"name\":\"...\"}, or {\"type\":\"set_value\",\"value\":\"...\"}.", "oneOf": [
                         action_object("invoke", json!({}), &[]),
                         action_object("focus", json!({}), &[]),
                         action_object("named", json!({"name": {"type": "string", "pattern": ".*\\S.*"}}), &["name"]),
@@ -81,7 +81,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             object(
                 json!({
                     "state_id": state_id(),
-                    "action": {"oneOf": [
+                    "action": {"description": "Object with type move, click, drag, or scroll.", "oneOf": [
                         action_object("move", coordinates(&["x", "y"]), &["x", "y"]),
                         action_object("click", merge(coordinates(&["x", "y"]), json!({
                             "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
@@ -106,7 +106,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 json!({
                     "state_id": state_id(),
                     "focus": object(coordinates(&["x", "y"]), &["x", "y"]),
-                    "action": {"oneOf": [
+                    "action": {"description": "Object: {\"type\":\"press\",\"key\":\"Ctrl+L\"} or {\"type\":\"type\",\"text\":\"...\"}.", "oneOf": [
                         action_object("press", json!({"key": {"type": "string", "pattern": "^(?!(?=.*(?:^|\\+)\\s*[Aa][Ll][Tt]\\s*(?:\\+|$))(?=.*(?:^|\\+)\\s*[Tt][Aa][Bb]\\s*(?:\\+|$))).*\\S.*$", "description": "Examples: Ctrl+L, Enter, F5, é. Chords containing both Alt and Tab are rejected."}}), &["key"]),
                         action_object("type", json!({"text": {"type": "string"}}), &["text"])
                     ]}
