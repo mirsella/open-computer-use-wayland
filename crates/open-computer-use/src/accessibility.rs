@@ -15,7 +15,7 @@ use crate::{
     errors::{RuntimeError, ToolOutcome},
     input::GeneratedInputAction,
     runtime::{DesktopRuntime, ToolOutput},
-    screenshot::{NoScreenshots, ScreenshotMapping, ScreenshotProvider},
+    screenshot::{NoScreenshots, SESSION_UNAVAILABLE, ScreenshotMapping, ScreenshotProvider},
     validation::{ApplicationScope, ElementAction, MAX_TEXT_LIMIT, TextLimit, ToolCall},
 };
 
@@ -292,6 +292,30 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             mutation: Arc::new(tokio::sync::Mutex::new(())),
             launch_in_progress: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) async fn prepare_desktop_session(&self) -> Result<(), RuntimeError> {
+        timeout(self.config.portal_timeout, self.screenshots.prepare())
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    "backend_timeout",
+                    "KDE RemoteDesktop approval timed out during MCP startup",
+                    ToolOutcome::NotStarted,
+                    true,
+                    "Enable the MCP again and approve the KDE RemoteDesktop request.",
+                )
+            })?
+            .map(|_| ())
+            .map_err(|error| {
+                RuntimeError::new(
+                    "backend_failed",
+                    format!("KDE RemoteDesktop approval failed during MCP startup: {error}"),
+                    ToolOutcome::NotStarted,
+                    true,
+                    "Enable the MCP again and approve the KDE RemoteDesktop request.",
+                )
+            })
     }
 
     async fn list_running_apps(&self) -> Result<Vec<AppInfo>, RuntimeError> {
@@ -680,16 +704,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         action: GeneratedInputAction,
     ) -> Result<ToolOutput, RuntimeError> {
         let (cached, mapping) = self.required_screenshot(state_id)?;
-        let preparation = timeout(self.config.portal_timeout, self.screenshots.prepare())
-            .await
-            .map_err(|_| operational_error("portal setup timed out before generated input"))?
-            .map_err(|error| operational_error(error.to_string()))?;
-        if preparation.consent_interrupted_observation {
-            self.consume_screenshot_mapping(&cached)?;
-            return Err(operational_error(
-                "portal consent invalidated the screenshot; call observe and inspect the new image before retrying generated input",
-            ));
-        }
         self.fresh_for_action(&cached).await?;
         self.require_latest_generation(&cached)?;
         let preparation = timeout(
@@ -700,7 +714,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         let cleanup = self.screenshots.cleanup_input().await;
         let preparation = preparation
             .map_err(|_| operational_error("generated input preparation timed out"))?
-            .map_err(operational_error);
+            .map_err(generated_input_error);
         if let Err(error) = preparation {
             if let Err(cleanup) = cleanup {
                 eprintln!(
@@ -772,29 +786,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ));
         }
         self.commit_snapshot(refreshed)
-    }
-
-    fn consume_screenshot_mapping(&self, expected: &Snapshot) -> Result<(), RuntimeError> {
-        let mut cache = self.lock_cache()?;
-        let current = cache.current.as_mut().ok_or_else(|| {
-            state_required_error("state cache lost the observation before generated input")
-        })?;
-        if current.snapshot.generation != expected.generation
-            || current.snapshot.app.pid != expected.app.pid
-            || current.snapshot.app.object != expected.app.object
-            || current.snapshot.window.object != expected.window.object
-        {
-            return Err(stale_state_error(format!(
-                "stale mutation plan: expected generation {}, latest generation {}",
-                expected.generation, current.snapshot.generation
-            )));
-        }
-        if current.screenshot_mapping.take().is_none() {
-            return Err(state_required_error(
-                "generated input requires a fresh observe screenshot",
-            ));
-        }
-        Ok(())
     }
 
     async fn observe(&self, mut snapshot: Arc<Snapshot>) -> ToolOutput {
@@ -1595,6 +1586,20 @@ fn truncate(value: &str, limit: usize) -> String {
 
 fn operational_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::not_started("target_unavailable", message)
+}
+
+fn generated_input_error(message: String) -> RuntimeError {
+    if message.starts_with(SESSION_UNAVAILABLE) {
+        RuntimeError::new(
+            "backend_failed",
+            message,
+            ToolOutcome::NotStarted,
+            false,
+            "Disable and re-enable the MCP to request KDE approval again.",
+        )
+    } else {
+        operational_error(message)
+    }
 }
 
 fn state_required_error(message: impl Into<String>) -> RuntimeError {
@@ -2523,7 +2528,6 @@ mod tests {
             accessibility_generation: snapshot.generation,
             portal_session_identity: session.into(),
             portal_session_generation: 1,
-            remote_desktop_devices: crate::portal::GrantedDevices::from_mask_for_mapping(3),
             stream: crate::portal::PortalStream {
                 stream_index: 0,
                 node_id: 1,

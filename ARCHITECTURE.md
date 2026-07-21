@@ -58,6 +58,12 @@ AT-SPI `Component.GrabFocus`; invoke never falls back to focus.
 
 ## Action flow
 
+The production MCP establishes its RemoteDesktop/ScreenCast session before the
+stdio protocol starts. KDE therefore restores or requests monitor, pointer, and
+keyboard approval as soon as the host enables the MCP. Startup fails if approval
+or capture setup fails. A failed or revoked established session is not recreated
+inside a tool call; the host must restart the MCP before KDE is prompted again.
+
 An element, pointer, or keyboard action requires the current state ID. Before acting,
 the service re-discovers the app, verifies the PID and exact window, traverses
 fresh state, and relocates any generation-scoped element. After a bounded settle
@@ -114,8 +120,6 @@ keyboard actions additionally wait for one synchronized keyboard on that pointer
 seat. EIS calls and queued held-input releases share an async lock. Cleanup is an awaited barrier.
 Setup cancellation, timeout, EOF, protocol errors, and disconnects invalidate
 and close the whole portal session rather than switching transports.
-If consent invalidates a screenshot, the pending action stops and the caller
-must obtain and inspect a new state image before retrying.
 It uses ashpd's maintained interface proxies and zbus for the raw Start response
 because ashpd 0.13.13 does not expose ScreenCast v6 `pipewire-serial`.
 
@@ -134,8 +138,8 @@ capture invalidates the stream. Header/chunk corruption, chunk offset modulo
 maxsize, aligned wrapped rows, positive or negative stride, row padding,
 transform, and renegotiated dimensions are validated before the newest owned
 complete frame enters the bounded watch channel. Stream errors, disconnects,
-and target-node loss invalidate capture and cause clean recreation on the next
-observation.
+and target-node loss exhaust the process-local desktop session; the MCP must be
+disabled and re-enabled before KDE can restore or request approval again.
 
 Each accepted PipeWire format has its own generation. A format change clears the
 watch channel before buffer renegotiation, so frame waits cannot return pixels
@@ -149,8 +153,7 @@ global logical coordinates, and PNG pixels as separate values. It computes scale
 per axis, so negative origins, rotation, and fractional scaling need no guessed
 desktop-wide scale. The cache records PID, app/window identity, AT-SPI and portal
 generations, session and stream identity, PipeWire serial and frame generation,
-monitor crop, PNG size, transform, scales, mapping ID, and the exact device mask
-granted by `RemoteDesktop.Start`. After frame acquisition, AT-SPI discovery must
+monitor crop, PNG size, transform, scales, and mapping ID. After frame acquisition, AT-SPI discovery must
 still report the exact PID, app object, and window object before cache binding.
 
 Before generated input, the monitor stream must match exactly one resumed EIS

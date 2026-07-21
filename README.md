@@ -54,13 +54,18 @@ Build and install the binary from this checkout:
 cargo install --locked --path crates/open-computer-use
 ```
 
-Ask KDE to approve one monitor plus pointer and keyboard access:
+When OpenCode enables the MCP, the server immediately asks KDE to restore or
+approve one monitor plus pointer and keyboard access. It does this before
+advertising tools. If the session later fails or is revoked, tools fail and ask
+you to re-enable the MCP instead of opening another chooser.
+
+You can approve the grant separately before enabling the MCP if preferred:
 
 ```sh
 open-computer-use init
 ```
 
-The command stores a private, one-shot restore token. KDE may ask again after
+`init` stores a private, one-shot restore token. KDE may ask again after
 revocation, a display change, or an expired grant. The server cannot approve
 the chooser or select a monitor on the user's behalf.
 
@@ -76,9 +81,10 @@ The MCP key is `computer_use`, so OpenCode prefixes tool names with
 
 ## Runtime model
 
-The portal session starts lazily on the first `observe`. The selected monitor's
-full composited image is returned, including unrelated apps, occluding windows,
-and desktop content. The longest encoded dimension is capped at 1280 pixels.
+The MCP establishes its portal session at startup. The selected monitor's full
+composited image is returned by observations, including unrelated apps,
+occluding windows, and desktop content. The longest encoded dimension is capped
+at 1280 pixels.
 
 Pointer and keyboard coordinates use `screenshot_png_pixels`. Accessibility
 element frames use a separate `atspi_window_coordinates` space and must not be

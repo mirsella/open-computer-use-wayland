@@ -126,9 +126,6 @@ fn validate_mapping(
     {
         return Err("portal session identity is stale or closed".into());
     }
-    if session.granted_devices() != mapping.remote_desktop_devices {
-        return Err("portal session granted-device mask changed since screenshot capture".into());
-    }
     if !mapping.monitor.scale_x.is_finite()
         || !mapping.monitor.scale_y.is_finite()
         || mapping.monitor.scale_x <= 0.0
@@ -158,7 +155,6 @@ mod tests {
         capture::FrameMetadata,
         encoder::{PngMapping, encode_with_limits},
         geometry::{MonitorMapping, PixelRect, Transform},
-        portal::GrantedDevices,
     };
 
     fn fixture(transform: Transform) -> (Snapshot, ScreenshotMapping, PortalStream) {
@@ -199,7 +195,6 @@ mod tests {
             accessibility_generation: 7,
             portal_session_identity: "/session/test".into(),
             portal_session_generation: 4,
-            remote_desktop_devices: GrantedDevices::from_mask_for_mapping(3),
             stream: PortalStream {
                 stream_index: 0,
                 node_id: 22,
@@ -279,7 +274,7 @@ mod tests {
             Transform::FlipRotate270,
         ] {
             let (snapshot, mapping, stream) = fixture(transform);
-            let (session, _) = PortalSessionLease::for_test("/session/test", 4, 3);
+            let (session, _) = PortalSessionLease::for_test("/session/test", 4);
             let point = map_png_point(&snapshot, &mapping, &session, &stream, 75.0, 30.0).unwrap();
             assert_eq!(point.0, -1550.0, "{transform:?}");
             assert_eq!(point.1, 20.0, "{transform:?}");
@@ -289,7 +284,7 @@ mod tests {
     #[test]
     fn rejects_exact_edges_stale_state_and_changed_streams() {
         let (snapshot, mapping, stream) = fixture(Transform::Normal);
-        let (session, closed) = PortalSessionLease::for_test("/session/test", 4, 3);
+        let (session, closed) = PortalSessionLease::for_test("/session/test", 4);
         assert!(map_png_point(&snapshot, &mapping, &session, &stream, 599.999, 0.0).is_ok());
         assert!(
             map_png_point(&snapshot, &mapping, &session, &stream, 600.0, 0.0,)
@@ -311,12 +306,6 @@ mod tests {
             map_png_point(&snapshot, &mapping, &session, &changed, 1.0, 1.0)
                 .unwrap_err()
                 .contains("changed")
-        );
-        let (different_grants, _) = PortalSessionLease::for_test("/session/test", 4, 1);
-        assert!(
-            map_png_point(&snapshot, &mapping, &different_grants, &stream, 1.0, 1.0)
-                .unwrap_err()
-                .contains("granted-device mask")
         );
         closed.send_replace(true);
         assert!(
@@ -367,7 +356,7 @@ mod tests {
         mapping.monitor.scale_y = 1.5;
         mapping.stream.logical_size = Some((1000, 1000));
         stream.logical_size = Some((1000, 1000));
-        let (session, _) = PortalSessionLease::for_test("/session/test", 4, 3);
+        let (session, _) = PortalSessionLease::for_test("/session/test", 4);
         let png_x = f64::from(mapping.output.size.0) * 0.25;
         let png_y = f64::from(mapping.output.size.1) * 0.75;
         let point = map_png_point(&snapshot, &mapping, &session, &stream, png_x, png_y).unwrap();

@@ -16,7 +16,7 @@ use crate::{
     validation::validate_call,
 };
 
-const HELP: &str = "Open Computer Use for Linux Wayland\n\nUsage:\n  open-computer-use [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Start the stdio MCP server.\n  call FILE     Execute one call object or an array of calls in one stateful runtime; use - for stdin.\n  list-apps     List live apps with accessible top-level windows.\n  snapshot APP  Print a bounded text-only AT-SPI snapshot.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_applications\",\"arguments\":{\"scope\":\"running\"}} objects and prints one standard MCP result per line. Run init once before adding the MCP server to OpenCode. KDE may ask again after revocation or display changes.\n";
+const HELP: &str = "Open Computer Use for Linux Wayland\n\nUsage:\n  open-computer-use [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Restore or request KDE approval, then start the stdio MCP server.\n  call FILE     Execute one call object or an array of calls in one stateful runtime; use - for stdin.\n  list-apps     List live apps with accessible top-level windows.\n  snapshot APP  Print a bounded text-only AT-SPI snapshot.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_applications\",\"arguments\":{\"scope\":\"running\"}} objects and prints one standard MCP result per line. The MCP command requests KDE approval at startup. Run init only to approve it separately before enabling the MCP. KDE may ask again after revocation or display changes.\n";
 
 pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliError> {
     let arguments: Vec<_> = arguments.into_iter().collect();
@@ -51,7 +51,6 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
                 .approve()
                 .await
                 .map_err(CliError::Mcp)?;
-            let granted_devices = session.granted_devices();
             tokio::time::timeout(
                 Duration::from_secs(2),
                 session.close("initial portal approval completed"),
@@ -59,12 +58,6 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
             .await
             .map_err(|_| CliError::Mcp("timed out closing the temporary portal session".into()))?
             .map_err(CliError::Mcp)?;
-            if !granted_devices.keyboard() || !granted_devices.pointer() {
-                return Err(CliError::Mcp(format!(
-                    "KDE approved device mask {}, but both keyboard and pointer access are required",
-                    granted_devices.mask()
-                )));
-            }
             if !restore_token_saved {
                 return Err(CliError::Mcp(
                     "KDE approved the temporary session, but no reusable restore token was saved"

@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -24,15 +30,17 @@ use crate::{
 #[derive(Debug)]
 pub struct OpenComputerUseServer<R = SemanticRuntime<AtspiAdapter, ProductionScreenshotCoordinator>>
 {
-    runtime: R,
+    runtime: Arc<R>,
     execution_barrier: tokio::sync::Mutex<()>,
+    unavailable: AtomicBool,
 }
 
 impl<R> OpenComputerUseServer<R> {
-    pub fn new(runtime: R) -> Self {
+    pub fn new(runtime: Arc<R>) -> Self {
         Self {
             runtime,
             execution_barrier: tokio::sync::Mutex::new(()),
+            unavailable: AtomicBool::new(false),
         }
     }
 }
@@ -76,7 +84,15 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
             Err(error) => return Err(McpError::invalid_params(error.to_string(), None)),
         };
         let _execution = self.execution_barrier.lock().await;
-        let result = if context.ct.is_cancelled() {
+        let result = if self.unavailable.load(Ordering::Acquire) {
+            tool_error_result(&RuntimeError::new(
+                "backend_failed",
+                "the desktop session was shut down after cancellation cleanup failed",
+                ToolOutcome::NotStarted,
+                false,
+                "Disable and re-enable the MCP before issuing more computer-use calls.",
+            ))
+        } else if context.ct.is_cancelled() {
             eprintln!("open-computer-use: queued tool call cancelled before execution");
             tool_error_result(&RuntimeError::new(
                 "cancelled",
@@ -100,11 +116,13 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
                             eprintln!("open-computer-use: cancellation cleanup failed: {error}; shutting down the desktop session");
-                            shutdown_after_cleanup_failure(&self.runtime).await;
+                            self.unavailable.store(true, Ordering::Release);
+                            shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
                         }
                         Err(_) => {
                             eprintln!("open-computer-use: cancellation cleanup timed out; shutting down the desktop session");
-                            shutdown_after_cleanup_failure(&self.runtime).await;
+                            self.unavailable.store(true, Ordering::Release);
+                            shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
                         }
                     }
                     let error = RuntimeError::new(
@@ -132,28 +150,45 @@ async fn shutdown_after_cleanup_failure<R: DesktopRuntime>(runtime: &R) {
 
 pub async fn serve_stdio() -> Result<(), CliError> {
     let runtime = production_runtime();
-    let service = match OpenComputerUseServer::new(Arc::clone(&runtime))
-        .serve(rmcp::transport::stdio())
-        .await
-    {
-        Ok(service) => service,
-        // An MCP host may close stdin while starting or stopping the child.
-        // No request was accepted, so this is a clean shutdown rather than a server failure.
-        Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
-        Err(error) => {
-            return Err(CliError::Mcp(format!(
-                "failed to start MCP stdio server: {error}"
-            )));
-        }
-    };
-    let result =
+    eprintln!(
+        "open-computer-use: restoring or requesting KDE monitor, pointer, and keyboard approval"
+    );
+    let result = async {
+        runtime
+            .prepare_desktop_session()
+            .await
+            .map_err(|error| CliError::Mcp(error.to_string()))?;
+        let service = match OpenComputerUseServer::new(Arc::clone(&runtime))
+            .serve(rmcp::transport::stdio())
+            .await
+        {
+            Ok(service) => service,
+            // An MCP host may close stdin while starting or stopping the child.
+            // No request was accepted, so this is a clean shutdown rather than a server failure.
+            Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
+            Err(error) => {
+                return Err(CliError::Mcp(format!(
+                    "failed to start MCP stdio server: {error}"
+                )));
+            }
+        };
         service.waiting().await.map(|_| ()).map_err(|error| {
             CliError::Mcp(format!("MCP stdio server stopped with an error: {error}"))
-        });
-    if let Err(error) = runtime.shutdown().await {
-        eprintln!("open-computer-use: shutdown cleanup failed: {error}");
+        })
     }
-    result
+    .await;
+    let shutdown = runtime
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Mcp(format!("shutdown cleanup failed: {error}")));
+    match (result, shutdown) {
+        (Err(error), Err(shutdown)) => {
+            eprintln!("open-computer-use: shutdown also failed after server error: {shutdown}");
+            Err(error)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), shutdown) => shutdown,
+    }
 }
 
 pub fn production_runtime() -> Arc<SemanticRuntime<AtspiAdapter, ProductionScreenshotCoordinator>> {

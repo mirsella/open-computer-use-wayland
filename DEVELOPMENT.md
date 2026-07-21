@@ -47,7 +47,8 @@ paths. Portal lifecycle, raw metadata, token permissions, frame layout, bounded
 latest-frame delivery, geometry, mapping generations, and PNG limits also need
 deterministic tests. Cover request cancellation and changed handles,
 `Session.Closed`, restricted-FD ownership transfer, restore-token replacement,
-post-format buffer/metadata negotiation, stream failure/recreation, wrapped SPA
+ post-format buffer/metadata negotiation, stream failure/exhaustion without a new
+ portal request, wrapped SPA
 chunks, pixel orientation, and post-frame AT-SPI revalidation. Do not make the
 normal test suite depend on a live desktop.
 
@@ -57,8 +58,7 @@ full-monitor coordinate inversion, resume synchronization, and held-state
 cleanup. These tests must stay
 local and must not contact a desktop portal.
 Keep regression coverage for complete-action emulation transactions, fresh
-post-snapshot frames, post-keyboard synchronization, bounded shutdown, and
-consent-driven screenshot invalidation.
+post-snapshot frames, post-keyboard synchronization, and bounded shutdown.
 
 An ignored, non-mutating live discovery test is available:
 
@@ -72,8 +72,9 @@ Do not automate live click, typing, or any other generated input.
 
 ## OpenCode MCP integration
 
-Follow the canonical Cargo installation, `init`, and OpenCode registration in
-[README.md](README.md#install). The binary starts MCP only
+Follow the canonical Cargo installation and OpenCode registration in
+[README.md](README.md#install). `init` is optional preapproval; MCP startup
+itself restores or requests the full KDE portal grant. The binary starts MCP only
 through the explicit `mcp` subcommand; no-argument launch prints CLI help.
 `doctor`, `list-apps`, and `snapshot APP` do not start a portal session.
 `call FILE` executes one JSON call object or static array in one production

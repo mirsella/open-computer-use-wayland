@@ -15,9 +15,12 @@ use crate::{
         eis::ReisInputBackend,
         keyboard_input, pointer,
     },
-    portal::{GrantedDevices, PortalBackend, PortalSessionLease, PortalStream, XdgPortalBackend},
+    portal::{PortalBackend, PortalSessionLease, PortalStream, XdgPortalBackend},
     validation::{KeyboardAction, PointerAction},
 };
+
+pub(crate) const SESSION_UNAVAILABLE: &str =
+    "desktop session is unavailable; disable and re-enable the MCP to request KDE approval again";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenshotError(pub String);
@@ -43,7 +46,6 @@ pub struct ScreenshotMapping {
     pub accessibility_generation: u64,
     pub portal_session_identity: String,
     pub portal_session_generation: u64,
-    pub remote_desktop_devices: GrantedDevices,
     pub stream: PortalStream,
     pub source: FrameMetadata,
     pub monitor: MonitorMapping,
@@ -116,7 +118,7 @@ pub type ProductionScreenshotCoordinator = ScreenshotCoordinator<XdgPortalBacken
 pub struct ScreenshotCoordinator<P, C> {
     portal: P,
     capture: C,
-    state: Mutex<Option<ActiveCapture>>,
+    state: Mutex<CaptureState>,
 }
 
 impl<P, C> std::fmt::Debug for ScreenshotCoordinator<P, C>
@@ -144,7 +146,7 @@ impl<P, C> ScreenshotCoordinator<P, C> {
         Self {
             portal,
             capture,
-            state: Mutex::new(None),
+            state: Mutex::new(CaptureState::Fresh),
         }
     }
 }
@@ -158,6 +160,30 @@ struct ActiveCapture {
     input_frame_generation: Option<u64>,
 }
 
+enum CaptureState {
+    Fresh,
+    Active(ActiveCapture),
+    Exhausted,
+}
+
+impl CaptureState {
+    fn active(&self) -> Option<&ActiveCapture> {
+        if let Self::Active(active) = self {
+            Some(active)
+        } else {
+            None
+        }
+    }
+
+    fn active_mut(&mut self) -> Option<&mut ActiveCapture> {
+        if let Self::Active(active) = self {
+            Some(active)
+        } else {
+            None
+        }
+    }
+}
+
 impl<P, C> ScreenshotProvider for ScreenshotCoordinator<P, C>
 where
     P: PortalBackend,
@@ -165,47 +191,67 @@ where
 {
     async fn prepare(&self) -> Result<PrepareCapture, ScreenshotError> {
         let mut state = self.state.lock().await;
-        if state
-            .as_ref()
-            .is_some_and(|active| !active.session.is_closed() && active.capture.failure().is_none())
-        {
-            return Ok(PrepareCapture {
-                consent_interrupted_observation: false,
-            });
-        }
-        if let Some(active) = state.as_ref() {
-            let reason = active
-                .capture
-                .failure()
-                .unwrap_or_else(|| "portal session closed".into());
-            eprintln!("open-computer-use: recreating capture after {reason}");
-            *state = None;
+        let unavailable = match &*state {
+            CaptureState::Active(active) => {
+                let failure = active.capture.failure();
+                if !active.session.is_closed() && failure.is_none() {
+                    return Ok(PrepareCapture {
+                        consent_interrupted_observation: false,
+                    });
+                }
+                Some(failure.unwrap_or_else(|| "portal session closed".into()))
+            }
+            CaptureState::Exhausted => return Err(session_unavailable()),
+            CaptureState::Fresh => None,
+        };
+        if let Some(reason) = unavailable {
+            eprintln!("open-computer-use: desktop session became unavailable: {reason}");
+            exhaust_capture(&mut state, "desktop session became unavailable").await;
+            return Err(session_unavailable());
         }
         let connection = self.portal.establish().await.map_err(ScreenshotError)?;
-        let target = connection.stream.capture_target();
-        let mut capture = self
-            .capture
-            .start(connection.fd, target)
-            .map_err(ScreenshotError)?;
-        tokio::time::timeout(Duration::from_secs(5), capture.wait_ready())
-            .await
-            .map_err(|_| {
-                ScreenshotError(
-                    "timed out waiting for PipeWire shared-memory capture; the source may be DMA-BUF-only"
-                        .into(),
-                )
-            })?
-            .map_err(ScreenshotError)?;
-        let session = connection.session;
-        *state = Some(ActiveCapture {
-            capture,
-            session,
-            stream: connection.stream,
-            input: None,
-            input_frame_generation: None,
-        });
+        let session = Arc::clone(&connection.session);
+        let consent_interrupted_observation = connection.consent_interrupted_observation;
+        let active = async {
+            let mut capture = self
+                .capture
+                .start(connection.fd, connection.stream.capture_target())
+                .map_err(ScreenshotError)?;
+            tokio::time::timeout(Duration::from_secs(5), capture.wait_ready())
+                .await
+                .map_err(|_| {
+                    ScreenshotError(
+                        "timed out waiting for PipeWire shared-memory capture; the source may be DMA-BUF-only"
+                            .into(),
+                    )
+                })?
+                .map_err(ScreenshotError)?;
+            if connection.session.is_closed() {
+                return Err(ScreenshotError(
+                    "portal RemoteDesktop session closed during PipeWire startup".into(),
+                ));
+            }
+            Ok(ActiveCapture {
+                capture,
+                session: connection.session,
+                stream: connection.stream,
+                input: None,
+                input_frame_generation: None,
+            })
+        }
+        .await;
+        let active = match active {
+            Ok(active) => active,
+            Err(error) => {
+                if !close_startup_session(&session, "desktop session startup failed").await {
+                    *state = CaptureState::Exhausted;
+                }
+                return Err(error);
+            }
+        };
+        *state = CaptureState::Active(active);
         Ok(PrepareCapture {
-            consent_interrupted_observation: connection.consent_interrupted_observation,
+            consent_interrupted_observation,
         })
     }
 
@@ -215,7 +261,7 @@ where
     ) -> Result<ScreenshotObservation, ScreenshotError> {
         let mut state = self.state.lock().await;
         let active = state
-            .as_mut()
+            .active_mut()
             .ok_or_else(|| ScreenshotError("portal capture session is not established".into()))?;
         if active.session.is_closed() {
             eprintln!(
@@ -269,7 +315,6 @@ where
                 accessibility_generation: snapshot.generation,
                 portal_session_identity: active.session.identity().to_owned(),
                 portal_session_generation: active.session.generation(),
-                remote_desktop_devices: active.session.granted_devices(),
                 stream: stream.clone(),
                 source,
                 monitor,
@@ -286,16 +331,15 @@ where
     ) -> Result<(), String> {
         let mut state = self.state.lock().await;
         let active = state
-            .as_mut()
-            .ok_or_else(|| "portal capture/input session is not established".to_owned())?;
+            .active_mut()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+        if active.session.is_closed() {
+            exhaust_capture(&mut state, "portal session closed before input preparation").await;
+            return Err(SESSION_UNAVAILABLE.into());
+        }
         ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         validate_current_capture(active, mapping).await?;
         let keyboard_required = matches!(action, GeneratedInputAction::Keyboard { .. });
-        if !active.session.granted_devices().pointer()
-            || (keyboard_required && !active.session.granted_devices().keyboard())
-        {
-            return Err("the portal session lacks grants required for this EIS action".into());
-        }
         let region = EisRegion {
             position: mapping
                 .stream
@@ -312,13 +356,13 @@ where
             match ReisInputBackend::connect(Arc::clone(&active.session), region).await {
                 Ok(input) => active.input = Some(input),
                 Err(error) => {
-                    *state = None;
-                    return Err(error);
+                    exhaust_capture(&mut state, "EIS setup failed").await;
+                    return Err(format!("{SESSION_UNAVAILABLE}: EIS setup failed: {error}"));
                 }
             }
         }
         let active = state
-            .as_mut()
+            .active_mut()
             .ok_or_else(|| "capture state disappeared after EIS setup".to_owned())?;
         if connected_now {
             validate_current_capture(active, mapping).await?;
@@ -341,16 +385,20 @@ where
     ) -> Result<(), String> {
         let mut state = self.state.lock().await;
         let active = state
-            .as_mut()
-            .ok_or_else(|| "portal capture/input session is not established".to_owned())?;
+            .active_mut()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+        if active.session.is_closed() {
+            exhaust_capture(&mut state, "portal session closed before generated input").await;
+            return Err(SESSION_UNAVAILABLE.into());
+        }
         ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         if let Err(error) = validate_current_capture(active, mapping).await {
             eprintln!("open-computer-use: invalidating capture before input: {error}");
-            *state = None;
+            exhaust_capture(&mut state, "capture validation failed before input").await;
             return Err(error);
         }
         let active = state
-            .as_mut()
+            .active_mut()
             .ok_or_else(|| "capture state disappeared after pre-input validation".to_owned())?;
         let input = active
             .input
@@ -414,7 +462,7 @@ where
     async fn cleanup_input(&self) -> Result<(), String> {
         let input = {
             let state = self.state.lock().await;
-            let Some(active) = state.as_ref() else {
+            let Some(active) = state.active() else {
                 return Ok(());
             };
             active.input.clone()
@@ -426,34 +474,66 @@ where
     }
 
     async fn shutdown_input(&self) -> Result<(), String> {
-        let active = self.state.lock().await.take();
+        let active = take_active(&mut *self.state.lock().await);
         let Some(active) = active else {
             return Ok(());
         };
-        let ActiveCapture {
-            capture,
-            session,
-            stream: _,
-            input,
-            input_frame_generation: _,
-        } = active;
-        let cleanup = match input.as_ref() {
-            Some(input) => tokio::time::timeout(Duration::from_secs(2), input.cleanup_barrier())
-                .await
-                .unwrap_or_else(|_| {
-                    Err("timed out neutralizing EIS input during shutdown".to_owned())
-                }),
-            None => Ok(()),
-        };
-        drop(capture);
-        drop(input);
-        let close = tokio::time::timeout(
-            Duration::from_secs(2),
-            session.close("computer-use shutdown"),
-        )
+        close_active(active, "computer-use shutdown").await
+    }
+}
+
+fn take_active(state: &mut CaptureState) -> Option<ActiveCapture> {
+    match std::mem::replace(state, CaptureState::Exhausted) {
+        CaptureState::Active(active) => Some(active),
+        CaptureState::Fresh | CaptureState::Exhausted => None,
+    }
+}
+
+async fn exhaust_capture(state: &mut CaptureState, reason: &str) {
+    if let Some(active) = take_active(state)
+        && let Err(error) = close_active(active, reason).await
+    {
+        eprintln!("open-computer-use: exhausted session cleanup failed: {error}");
+    }
+}
+
+async fn close_active(active: ActiveCapture, reason: &str) -> Result<(), String> {
+    let ActiveCapture {
+        capture,
+        session,
+        stream: _,
+        input,
+        input_frame_generation: _,
+    } = active;
+    let cleanup = match input.as_ref() {
+        Some(input) => tokio::time::timeout(Duration::from_secs(2), input.cleanup_barrier())
+            .await
+            .unwrap_or_else(|_| Err("timed out neutralizing EIS input during shutdown".to_owned())),
+        None => Ok(()),
+    };
+    drop(capture);
+    drop(input);
+    let close = tokio::time::timeout(Duration::from_secs(2), session.close(reason))
         .await
         .unwrap_or_else(|_| Err("timed out closing the portal session during shutdown".to_owned()));
-        cleanup.and(close)
+    cleanup.and(close)
+}
+
+fn session_unavailable() -> ScreenshotError {
+    ScreenshotError(SESSION_UNAVAILABLE.into())
+}
+
+async fn close_startup_session(session: &PortalSessionLease, reason: &str) -> bool {
+    match tokio::time::timeout(Duration::from_secs(2), session.close(reason)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            eprintln!("open-computer-use: failed to close partial startup session: {error}");
+            false
+        }
+        Err(_) => {
+            eprintln!("open-computer-use: timed out closing partial startup session");
+            false
+        }
     }
 }
 
@@ -531,7 +611,7 @@ mod tests {
         accessibility::{AppInfo, SnapshotLimits, WindowInfo},
         capture::{CaptureFuture, CaptureSession, CaptureTarget},
         geometry::{PixelRect, Transform},
-        portal::{GrantedDevices, PortalCapabilities, PortalConnection},
+        portal::{PortalCapabilities, PortalConnection},
     };
 
     struct FakePortal {
@@ -653,7 +733,7 @@ mod tests {
     ) -> (PortalConnection, tokio::sync::watch::Sender<bool>) {
         let (read, mut write) = UnixStream::pair().unwrap();
         write.write_all(&[marker]).unwrap();
-        let (session, closed) = PortalSessionLease::for_test("/session/test", generation, 3);
+        let (session, closed) = PortalSessionLease::for_test("/session/test", generation);
         (
             PortalConnection {
                 fd: read.into(),
@@ -671,6 +751,32 @@ mod tests {
             },
             closed,
         )
+    }
+
+    fn test_coordinator(
+        connections: impl IntoIterator<Item = PortalConnection>,
+        capture: Arc<FakeCaptureState>,
+    ) -> ScreenshotCoordinator<FakePortal, FakeCaptureBackend> {
+        ScreenshotCoordinator::new(
+            FakePortal {
+                connections: StdMutex::new(connections.into_iter().collect()),
+                establishes: AtomicUsize::new(0),
+            },
+            FakeCaptureBackend(capture),
+        )
+    }
+
+    async fn assert_terminal(coordinator: &ScreenshotCoordinator<FakePortal, FakeCaptureBackend>) {
+        for _ in 0..2 {
+            assert!(
+                coordinator
+                    .prepare()
+                    .await
+                    .unwrap_err()
+                    .0
+                    .contains("disable and re-enable the MCP")
+            );
+        }
     }
 
     fn test_snapshot() -> Snapshot {
@@ -707,57 +813,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_fd_failure_and_session_close_recreate_capture_cleanly() {
+    async fn failed_or_closed_session_requires_mcp_restart_without_another_prompt() {
         let (first, first_closed) = test_connection(1, 11);
-        let (second, second_closed) = test_connection(2, 22);
-        let (third, _) = test_connection(3, 33);
+        let (second, _) = test_connection(2, 22);
         let capture_state = Arc::new(FakeCaptureState::default());
-        let coordinator = ScreenshotCoordinator::new(
-            FakePortal {
-                connections: StdMutex::new(VecDeque::from([first, second, third])),
-                establishes: AtomicUsize::new(0),
-            },
-            FakeCaptureBackend(Arc::clone(&capture_state)),
-        );
+        let coordinator = test_coordinator([first, second], Arc::clone(&capture_state));
 
         coordinator.prepare().await.unwrap();
         assert_eq!(*capture_state.markers.lock().unwrap(), [11]);
         *capture_state.failures.lock().unwrap()[0].lock().unwrap() =
             Some("target node disappeared".into());
-        coordinator.prepare().await.unwrap();
-        assert_eq!(*capture_state.markers.lock().unwrap(), [11, 22]);
+        assert_terminal(&coordinator).await;
+        assert_eq!(*capture_state.markers.lock().unwrap(), [11]);
         assert_eq!(capture_state.drops.load(Ordering::Acquire), 1);
-
-        second_closed.send_replace(true);
-        coordinator.prepare().await.unwrap();
-        assert_eq!(*capture_state.markers.lock().unwrap(), [11, 22, 33]);
-        assert_eq!(capture_state.drops.load(Ordering::Acquire), 2);
-        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 3);
+        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 1);
         drop(first_closed);
+
+        let (connection, closed) = test_connection(3, 33);
+        let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
+        coordinator.prepare().await.unwrap();
+        closed.send_replace(true);
+        assert_terminal(&coordinator).await;
+        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
-    async fn coordinator_binds_frame_and_exact_granted_devices() {
+    async fn startup_failure_can_retry_but_shutdown_is_terminal() {
+        let (mut broken, _) = test_connection(1, 11);
+        let broken_session = Arc::clone(&broken.session);
+        broken.stream.stream_index = 1;
+        let (valid, _) = test_connection(2, 22);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        let coordinator = test_coordinator([broken, valid], capture_state);
+
+        assert!(coordinator.prepare().await.is_err());
+        assert!(broken_session.is_closed());
+        coordinator.prepare().await.unwrap();
+        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 2);
+        coordinator.shutdown_input().await.unwrap();
+        assert_terminal(&coordinator).await;
+        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn coordinator_binds_frame_and_session_identity() {
         let (connection, _) = test_connection(9, 44);
         let capture_state = Arc::new(FakeCaptureState::default());
-        let coordinator = ScreenshotCoordinator::new(
-            FakePortal {
-                connections: StdMutex::new(VecDeque::from([connection])),
-                establishes: AtomicUsize::new(0),
-            },
-            FakeCaptureBackend(capture_state),
-        );
+        let coordinator = test_coordinator([connection], capture_state);
         coordinator.prepare().await.unwrap();
         let observation = coordinator.capture(&test_snapshot()).await.unwrap();
         assert_eq!(observation.mapping.source.generation, 2);
         assert_eq!(observation.mapping.portal_session_generation, 9);
-        assert_eq!(
-            observation.mapping.remote_desktop_devices,
-            GrantedDevices::from_mask_for_mapping(3)
-        );
-        assert!(observation.mapping.remote_desktop_devices.keyboard());
-        assert!(observation.mapping.remote_desktop_devices.pointer());
-
         let matching = OwnedFrame {
             metadata: FrameMetadata {
                 generation: observation.mapping.source.generation + 1,

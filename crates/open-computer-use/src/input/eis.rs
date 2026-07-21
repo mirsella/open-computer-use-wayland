@@ -202,7 +202,7 @@ impl Drop for EisAttemptGuard {
     fn drop(&mut self) {
         if self.armed {
             self.session
-                .invalidate("ConnectToEIS setup was interrupted or failed");
+                .invalidate_eis("ConnectToEIS setup was interrupted or failed");
         }
     }
 }
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[test]
     fn interrupted_attempt_invalidates_the_portal_session() {
-        let (session, _) = PortalSessionLease::for_test("/session/eis", 1, 3);
+        let (session, _) = PortalSessionLease::for_test("/session/eis", 1);
         let attempt = EisAttemptGuard::new(Arc::clone(&session)).unwrap();
         drop(attempt);
         assert!(session.is_closed());

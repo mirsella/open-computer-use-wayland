@@ -35,8 +35,6 @@ Current safeguards:
 - coordinates are never clamped and no global scale is inferred;
 - pointer movement uses the same single-use screenshot mapping as clicks but
   emits no button event; hover effects and auto-hidden panels may still change;
-- when portal consent invalidates the screenshot, the pending generated action
-  is rejected until the caller obtains and inspects a new `observe` image;
 - generated input uses only the approved portal session's EIS connection; no
   portal `Notify*`, X11, direct-device, clipboard, or subprocess fallback exists;
 - held keys and buttons use a central reverse-order cleanup guard on success,

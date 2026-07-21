@@ -113,7 +113,7 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     let server_runtime = runtime.clone();
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::<FakeRuntime>::new(server_runtime.clone())
+        let service = OpenComputerUseServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
             .serve(server_transport)
             .await
             .expect("initialize server");
@@ -298,7 +298,7 @@ async fn results_for_protocol(protocol_version: &str) -> (Value, Value) {
     let server_runtime = runtime.clone();
     let (server_transport, client_transport) = tokio::io::duplex(8 * 1024);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::<FakeRuntime>::new(server_runtime.clone())
+        let service = OpenComputerUseServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
             .serve(server_transport)
             .await
             .expect("initialize server");

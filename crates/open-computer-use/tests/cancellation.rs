@@ -123,10 +123,10 @@ async fn cancelled_runtime_call_emits_no_response_and_server_continues() {
     let calls = Arc::new(AtomicUsize::new(0));
     let server_calls = Arc::clone(&calls);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::new(BlockingRuntime {
+        let service = OpenComputerUseServer::new(Arc::new(BlockingRuntime {
             calls: server_calls,
             cleanup_complete: server_cleanup,
-        })
+        }))
         .serve(server_transport)
         .await
         .expect("initialize server");
@@ -202,10 +202,10 @@ async fn failed_cancellation_cleanup_forces_shutdown_before_next_call() {
     let server_calls = Arc::clone(&calls);
     let server_shutdowns = Arc::clone(&shutdowns);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::new(CleanupFailureRuntime {
+        let service = OpenComputerUseServer::new(Arc::new(CleanupFailureRuntime {
             calls: server_calls,
             shutdowns: server_shutdowns,
-        })
+        }))
         .serve(server_transport)
         .await
         .expect("initialize server");
@@ -250,7 +250,11 @@ async fn failed_cancellation_cleanup_forces_shutdown_before_next_call() {
         .await
         .unwrap();
     client.send(message(tool_call(3))).await.unwrap();
-    assert_eq!(response_id(client.receive().await.unwrap()), Some(3));
+    let response = client.receive().await.unwrap();
+    assert_eq!(response_id(response.clone()), Some(3));
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["result"]["isError"], true);
+    assert_eq!(calls.load(Ordering::Acquire), 1);
     assert_eq!(shutdowns.load(Ordering::Acquire), 1);
 
     drop(client);
@@ -265,10 +269,10 @@ async fn read_only_call_cancelled_while_queued_never_executes() {
     let server_calls = Arc::clone(&calls);
     let server_release = Arc::clone(&release_first);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::new(QueuedRuntime {
+        let service = OpenComputerUseServer::new(Arc::new(QueuedRuntime {
             calls: server_calls,
             release_first: server_release,
-        })
+        }))
         .serve(server_transport)
         .await
         .expect("initialize server");

@@ -27,6 +27,7 @@ use zbus::{
 use crate::capture::CaptureTarget;
 
 const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
+const REQUIRED_DEVICES: u32 = 3;
 const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
 pub(crate) const REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
@@ -114,40 +115,18 @@ pub struct PortalCapabilities {
     pub available_cursor_modes: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GrantedDevices {
-    mask: u32,
-}
-
-impl GrantedDevices {
-    pub const KEYBOARD: u32 = 1;
-    pub const POINTER: u32 = 2;
-
-    fn from_start(mask: u32, available: u32) -> Result<Self, String> {
-        if mask & !available != 0 {
-            return Err(format!(
-                "RemoteDesktop.Start granted devices outside AvailableDeviceTypes (granted={mask}, available={available})"
-            ));
-        }
-        Ok(Self { mask })
+fn validate_start_devices(mask: u32, requested: u32) -> Result<(), String> {
+    if mask & !requested != 0 {
+        return Err(format!(
+            "RemoteDesktop.Start granted devices outside the requested mask (granted={mask}, requested={requested})"
+        ));
     }
-
-    pub fn mask(self) -> u32 {
-        self.mask
+    if mask & REQUIRED_DEVICES != REQUIRED_DEVICES {
+        return Err(format!(
+            "KDE approved device mask {mask}, but both keyboard and pointer access are required"
+        ));
     }
-
-    pub fn keyboard(self) -> bool {
-        self.mask & Self::KEYBOARD != 0
-    }
-
-    pub fn pointer(self) -> bool {
-        self.mask & Self::POINTER != 0
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_mask_for_mapping(mask: u32) -> Self {
-        Self { mask }
-    }
+    Ok(())
 }
 
 pub trait PortalBackend: Send + Sync + 'static {
@@ -224,7 +203,7 @@ impl XdgPortalBackend {
                 );
             }
         })));
-        let session_guard = CloseGuard::new(session_proxy.clone(), "portal session");
+        let mut session_guard = CloseGuard::new(session_proxy.clone(), "portal session");
 
         let request_token = random_token("create")?;
         let mut request = RawRequest::new(&connection, &request_token).await?;
@@ -293,25 +272,27 @@ impl XdgPortalBackend {
         .await?;
         let mut start_results =
             start_remote_desktop(&connection, &remote, &session_path, &closed).await?;
-        let granted_devices = GrantedDevices::from_start(
-            take_owned(&mut start_results, "devices")?
-                .try_into()
-                .map_err(|error| format!("portal response devices has the wrong type: {error}"))?,
-            capabilities.available_device_types,
-        )?;
-        let complete_grant = granted_devices.keyboard() && granted_devices.pointer();
-        if !complete_grant {
-            eprintln!(
-                "open-computer-use: RemoteDesktop.Start granted incomplete device mask {}; generated input will reject this session and no restore token will be saved",
-                granted_devices.mask()
-            );
-        }
+        let granted_mask = take_owned(&mut start_results, "devices")?
+            .try_into()
+            .map_err(|error| format!("portal response devices has the wrong type: {error}"))?;
+        match validate_start_devices(granted_mask, REQUIRED_DEVICES) {
+            Ok(()) => {}
+            Err(error) => {
+                match session_proxy.call::<_, _, ()>("Close", &()).await {
+                    Ok(()) => session_guard.disarm(),
+                    Err(close_error) => eprintln!(
+                        "open-computer-use: failed to close rejected portal grant: {close_error}"
+                    ),
+                }
+                return Err(error);
+            }
+        };
         let stream = parse_streams(
             take_owned(&mut start_results, "streams")?,
             capabilities.screencast_version,
         )?;
         let mut restore_token_saved = false;
-        if complete_grant && let Some(store) = &self.token_store {
+        if let Some(store) = &self.token_store {
             let restore_token = match take_optional::<String>(&mut start_results, "restore_token") {
                 Ok(token) => token,
                 Err(error) => {
@@ -342,7 +323,6 @@ impl XdgPortalBackend {
         let lease = Arc::new(PortalSessionLease {
             path: session_path,
             generation,
-            granted_devices,
             closed,
             closed_sender,
             connection: Some(connection),
@@ -359,23 +339,41 @@ impl XdgPortalBackend {
 
     async fn establish_inner(&self) -> Result<PortalConnection, String> {
         let approval = self.approve().await?;
-        let connection = approval.session.connection()?;
-        let screencast = Screencast::with_connection(connection.clone())
-            .await
-            .map_err(portal_error)?;
-        let session = ObjectPath::try_from(approval.session.identity())
-            .map_err(|error| format!("invalid portal session path: {error}"))?;
-        let options: HashMap<&str, Value<'_>> = HashMap::new();
-        let fd: zbus::zvariant::OwnedFd = screencast
-            .call("OpenPipeWireRemote", &(session, options))
-            .await
-            .map_err(portal_error)?;
-        Ok(PortalConnection {
-            fd: fd.into(),
-            session: approval.session,
-            stream: approval.stream,
-            consent_interrupted_observation: true,
-        })
+        let result = async {
+            let connection = approval.session.connection()?;
+            let screencast = Screencast::with_connection(connection.clone())
+                .await
+                .map_err(portal_error)?;
+            let session = ObjectPath::try_from(approval.session.identity())
+                .map_err(|error| format!("invalid portal session path: {error}"))?;
+            let options: HashMap<&str, Value<'_>> = HashMap::new();
+            let fd: zbus::zvariant::OwnedFd = screencast
+                .call("OpenPipeWireRemote", &(session, options))
+                .await
+                .map_err(portal_error)?;
+            Ok::<_, String>(fd)
+        }
+        .await;
+        match result {
+            Ok(fd) => Ok(PortalConnection {
+                fd: fd.into(),
+                session: approval.session,
+                stream: approval.stream,
+                consent_interrupted_observation: true,
+            }),
+            Err(error) => {
+                if let Err(close) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    approval.session.close("PipeWire portal startup failed"),
+                )
+                .await
+                .unwrap_or_else(|_| Err("timed out closing failed portal startup".into()))
+                {
+                    eprintln!("open-computer-use: portal startup cleanup also failed: {close}");
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -421,7 +419,6 @@ pub struct PortalConnection {
 pub struct PortalSessionLease {
     path: String,
     generation: u64,
-    granted_devices: GrantedDevices,
     closed: watch::Receiver<bool>,
     closed_sender: watch::Sender<bool>,
     connection: Option<Connection>,
@@ -444,7 +441,6 @@ impl std::fmt::Debug for PortalSessionLease {
             .debug_struct("PortalSessionLease")
             .field("path", &self.path)
             .field("generation", &self.generation)
-            .field("granted_devices", &self.granted_devices)
             .field("closed", &*self.closed.borrow())
             .finish()
     }
@@ -457,10 +453,6 @@ impl PortalSessionLease {
 
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub fn granted_devices(&self) -> GrantedDevices {
-        self.granted_devices
     }
 
     pub fn is_closed(&self) -> bool {
@@ -528,18 +520,22 @@ impl PortalSessionLease {
     }
 
     pub(crate) fn invalidate(&self, reason: &str) {
-        match self.input_state.lock() {
-            Ok(mut state) => *state = EisConnectionState::Invalid,
-            Err(_) => eprintln!("open-computer-use: portal EIS state mutex poisoned"),
-        }
-        self.closed_sender.send_replace(true);
-        eprintln!("open-computer-use: invalidating portal session: {reason}");
+        self.invalidate_eis(reason);
         match self._close_guard.lock() {
             Ok(mut guard) => {
                 guard.close_now("invalid EIS portal session", self.connection.as_ref())
             }
             Err(_) => eprintln!("open-computer-use: portal session close mutex poisoned"),
         }
+    }
+
+    pub(crate) fn invalidate_eis(&self, reason: &str) {
+        match self.input_state.lock() {
+            Ok(mut state) => *state = EisConnectionState::Invalid,
+            Err(_) => eprintln!("open-computer-use: portal EIS state mutex poisoned"),
+        }
+        self.closed_sender.send_replace(true);
+        eprintln!("open-computer-use: invalidating portal session: {reason}");
     }
 
     pub(crate) async fn close(&self, reason: &str) -> Result<(), String> {
@@ -584,17 +580,12 @@ impl PortalSessionLease {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(
-        path: &str,
-        generation: u64,
-        device_mask: u32,
-    ) -> (Arc<Self>, watch::Sender<bool>) {
+    pub(crate) fn for_test(path: &str, generation: u64) -> (Arc<Self>, watch::Sender<bool>) {
         let (sender, closed) = watch::channel(false);
         (
             Arc::new(Self {
                 path: path.into(),
                 generation,
-                granted_devices: GrantedDevices { mask: device_mask },
                 closed,
                 closed_sender: sender.clone(),
                 connection: None,
@@ -1404,16 +1395,16 @@ mod tests {
 
     #[test]
     fn actual_device_grants_are_typed_and_validated() {
-        let both = GrantedDevices::from_start(3, 7).unwrap();
-        assert!(both.keyboard());
-        assert!(both.pointer());
-        assert_eq!(both.mask(), 3);
+        validate_start_devices(3, 3).unwrap();
 
-        let keyboard_only = GrantedDevices::from_start(1, 3).unwrap();
-        assert!(keyboard_only.keyboard());
-        assert!(!keyboard_only.pointer());
         assert!(
-            GrantedDevices::from_start(4, 3)
+            validate_start_devices(1, 3)
+                .unwrap_err()
+                .contains("both keyboard and pointer")
+        );
+        assert!(validate_start_devices(7, 3).is_err());
+        assert!(
+            validate_start_devices(4, 3)
                 .unwrap_err()
                 .contains("outside")
         );

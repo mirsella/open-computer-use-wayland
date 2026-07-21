@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 use rmcp::model::{CallToolResult, ContentBlock};
 
@@ -12,20 +12,6 @@ pub trait DesktopRuntime: Send + Sync + 'static {
     fn cleanup(&self) -> impl Future<Output = Result<(), RuntimeError>> + Send + '_;
     fn shutdown(&self) -> impl Future<Output = Result<(), RuntimeError>> + Send + '_ {
         async move { self.cleanup().await }
-    }
-}
-
-impl<R: DesktopRuntime> DesktopRuntime for Arc<R> {
-    async fn execute(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
-        (**self).execute(call).await
-    }
-
-    async fn cleanup(&self) -> Result<(), RuntimeError> {
-        (**self).cleanup().await
-    }
-
-    async fn shutdown(&self) -> Result<(), RuntimeError> {
-        (**self).shutdown().await
     }
 }
 
