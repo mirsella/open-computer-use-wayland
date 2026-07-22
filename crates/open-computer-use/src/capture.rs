@@ -821,10 +821,10 @@ fn append_rgba_pixels(
     format: VideoFormat,
     rgba: &mut Vec<u8>,
 ) -> Result<(), String> {
-    if source.len() % 4 != 0 {
+    if !source.len().is_multiple_of(4) {
         return Err("raw pixel segment is not four-byte aligned".into());
     }
-    for pixel in source.chunks_exact(4) {
+    for pixel in source.as_chunks::<4>().0 {
         match format {
             VideoFormat::BGRx => rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]),
             VideoFormat::RGBx => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),

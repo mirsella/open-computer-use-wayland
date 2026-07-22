@@ -37,7 +37,7 @@ static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn next_session_generation(counter: &AtomicU64) -> Result<u64, String> {
     let previous = counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
             generation.checked_add(1)
         })
         .map_err(|_| "portal session generation overflow".to_owned())?;
