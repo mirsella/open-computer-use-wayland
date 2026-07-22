@@ -1,5 +1,8 @@
 # Architecture
 
+The user-facing MCP contract is documented in [MCP.md](MCP.md). This document
+describes the implementation boundaries and invariants behind that contract.
+
 ## Boundaries
 
 The `open-computer-use` crate keeps protocol, policy, and desktop access apart:
@@ -37,8 +40,9 @@ bus address, then opens that address with zbus. It enumerates application roots
 from the AT-SPI registry and obtains each PID from the accessibility bus daemon.
 It neither runs shell helpers nor changes the process environment.
 
-App queries resolve in this order: cached PID, numeric PID, exact app name,
-exact window title, then app/window substring. A tier must have one match.
+App queries resolve in this order: cached PID, numeric PID, full case-insensitive
+app name, full case-insensitive window title, then case-insensitive app/window
+substring. A tier must have one match.
 Window selection prefers active, then showing, then the first viable top-level
 window. Later safety checks use exact window identity rather than requiring an
 AT-SPI active flag or global window position, neither of which KDE exposes
@@ -184,17 +188,3 @@ uses prior AT-SPI focus and emits no pointer events. Every transaction ends with
 a connection sync barrier; keyboard transactions also refresh modifier state.
 Active physical shortcut modifiers cause generated keyboard input to fail
 closed.
-
-## MCP results and errors
-
-Observations return text plus structured `state_id`, target identity, element
-capabilities, and screenshot metadata. A ready screenshot adds a complete-monitor
-`image/png` block. Screenshot metadata reports readiness, reason, width, height,
-and `screenshot_png_pixels`; pointer and point-focused keyboard calls use that
-space. Element frames remain in separate `atspi_window_coordinates`. Capture
-failures leave the observation available for semantic actions but mark the
-screenshot unavailable.
-
-Runtime tool errors include structured `code`, `message`, `outcome`
-(`not_started`, `unknown`, or `completed`), `retryable`, and `recovery`. Schema
-errors use JSON-RPC `InvalidParams` (`-32602`).

@@ -72,10 +72,11 @@ Do not automate live click, typing, or any other generated input.
 
 ## OpenCode MCP integration
 
-Follow the canonical Cargo installation and OpenCode registration in
-[README.md](README.md#install). `init` is optional preapproval; MCP startup
-itself restores or requests the full KDE portal grant. The binary starts MCP only
-through the explicit `mcp` subcommand; no-argument launch prints CLI help.
+Follow the Cargo installation and OpenCode registration in
+[README.md](README.md#install), and keep the user-facing contract in
+[MCP.md](MCP.md) synchronized with schemas and behavior. `init` is optional
+preapproval; MCP startup itself restores or requests the full KDE portal grant.
+The binary starts MCP only through the explicit `mcp` subcommand; no-argument launch prints CLI help.
 `doctor`, `list-apps`, and `snapshot APP` do not start a portal session.
 `call FILE` executes one JSON call object or static array in one production
 runtime without duplicating MCP validation or action logic. Static arrays cannot

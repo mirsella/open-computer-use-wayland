@@ -1,10 +1,14 @@
 # Security
 
+See [MCP.md](MCP.md) for the user-facing tool, state, coordinate, and error
+contract. This document describes the trust boundary and safeguards.
+
 AT-SPI access is powerful and does not use an XDG portal consent prompt. A
 process in the same graphical session can read text exposed by accessible apps
 and invoke their semantic actions. This can include private messages, document
 contents, form values, and controls with real side effects. Run this server only
-for a trusted local MCP host and user.
+for a trusted local MCP host and user. Installed-app launch is also independent
+of portal approval.
 
 Current safeguards:
 

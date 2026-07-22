@@ -5,32 +5,20 @@
 A local [Model Context Protocol](https://modelcontextprotocol.io/) server for
 computer use on Linux Wayland. It is built for KDE Plasma and OpenCode.
 
-The server combines:
+> [!WARNING]
+> Run this server only for a trusted local MCP host and user. Portal approval
+> controls capture and generated input, but it does not gate AT-SPI reads or
+> semantic actions. The host can receive accessible text and act on controls in
+> the logged-in graphical session. A screenshot contains the complete selected
+> monitor, including unrelated windows and notifications.
 
-- AT-SPI for app discovery, accessibility state, and semantic actions
-- XDG ScreenCast for screenshots of one user-approved monitor
-- XDG RemoteDesktop and EIS for pointer and keyboard input
-- GIO for installed app discovery and launch
+The server uses AT-SPI for semantic inspection and actions, XDG ScreenCast for
+one approved monitor, XDG RemoteDesktop with EIS for input, and GIO for app
+discovery and launch. It does not use X11, `/dev/uinput`, clipboard injection,
+compositor-private APIs, or guessed display geometry.
 
-It does not use X11, `/dev/uinput`, clipboard injection, compositor-private
-APIs, or guessed display geometry.
-
-## Tools
-
-| Tool | Purpose |
-| --- | --- |
-| `list_applications` | List running AT-SPI apps or installed desktop entries. |
-| `launch_application` | Launch an exact desktop ID returned by the installed listing. |
-| `observe` | Return full, visible, or interactive accessibility state, optional query matches, screenshot metadata, and the approved-monitor PNG. |
-| `act_on_element` | Invoke, focus, run a named action, or set an element value through AT-SPI. |
-| `pointer` | Move, click, drag, or scroll in screenshot pixel coordinates. |
-| `keyboard` | Focus by screenshot point or observed element ID, then press a key chord or type literal text. |
-
-`observe` returns an opaque `state_id`. The runtime retains a bounded set of
-latest observations for different app/window targets; observing the same target
-replaces its prior ID. A successful UI action returns a new observation and
-invalidates the acted-on ID. `launch_application` clears all states, so call
-`observe` after launch.
+See [MCP.md](MCP.md) for the six tools and their exact inputs, results, state
+lifecycle, coordinate rules, and error outcomes.
 
 ## Requirements
 
@@ -52,100 +40,73 @@ sudo apt-get install build-essential clang libclang-dev libdbus-1-dev \
 Build and install the binary from the repository:
 
 ```sh
-cargo install --locked --git https://github.com/mirsella/open-computer-use-wayland
+cargo install --locked --git https://github.com/mirsella/open-computer-use-wayland open-computer-use
+open-computer-use version
 ```
 
-When OpenCode enables the MCP, the server immediately asks KDE to restore or
-approve one monitor plus pointer and keyboard access. It does this before
-advertising tools. If the session later fails or is revoked, tools fail and ask
-you to re-enable the MCP instead of opening another chooser.
+The package name is explicit because this repository is a virtual Cargo
+workspace.
 
-You can approve the grant separately before enabling the MCP if preferred:
+## OpenCode setup
+
+The transport is stdio only. Configure the MCP host to execute
+`open-computer-use mcp`; do not run it interactively or add wrappers that write
+to stdout. The host owns stdin and stdout. Stdout contains one UTF-8 JSON-RPC
+message per line, while diagnostics go to stderr.
+
+You may request a reusable KDE portal grant before registration:
 
 ```sh
 open-computer-use init
 ```
 
-`init` stores a private, one-shot restore token. KDE may ask again after
-revocation, a display change, or an expired grant. The server cannot approve
-the chooser or select a monitor on the user's behalf.
+This step is optional. It closes the temporary session and succeeds only if KDE
+returns a reusable restore token.
 
 Register the binary with OpenCode:
 
 ```sh
 opencode mcp add computer_use -- "$(command -v open-computer-use)" mcp
+```
+
+Edit the config path printed by that command. Keep the absolute executable
+path, set the local MCP `timeout` to `90000`, and set
+`"computer_use_*": "ask"`. The complete config and permission caveats are in
+[MCP.md](MCP.md#opencode-configuration).
+
+Test the connection:
+
+```sh
 opencode mcp list
 ```
 
-The MCP key is `computer_use`, so OpenCode prefixes tool names with
-`computer_use_`.
-
-## Runtime model
-
-The MCP establishes its portal session at startup. The selected monitor's full
-composited image is returned by observations, including unrelated apps,
-occluding windows, and desktop content. The longest encoded dimension is capped
-at 1280 pixels.
-
-Pointer coordinates and point-focused keyboard calls use
-`screenshot_png_pixels`. A keyboard call may instead use an observed
-`element_id`; the server revalidates it, requests AT-SPI focus, and sends keys
-without a pointer click only after the element reports focused and its window
-reports active. Accessibility element frames use a separate
-`atspi_window_coordinates` space and must not be used as screenshot coordinates.
-
-Use `observe.view` with `full`, `visible`, or `interactive`. `visible` prunes
-hidden document subtrees such as background browser tabs; `interactive` further
-restricts output to elements with interactive roles, states, supported actions,
-or set-value capability. Optional `observe.query` matches semantic roles, names,
-values, text, states, and action labels without renumbering element IDs. These
-length-bounded filters affect accessibility output only; screenshots still
-contain the complete approved monitor.
-
-Before each action, the server rechecks the cached target and approved input
-mapping. Stale, missing, or ambiguous targets fail closed; see
-[ARCHITECTURE.md](ARCHITECTURE.md) for the mapping model.
-
-Runtime errors include `code`, `message`, `outcome`, `retryable`, and
-`recovery`. If screenshot capture fails, `observe` still returns the text state
-with `screenshot.ready: false` and a reason.
+The status check starts enabled servers temporarily and may open the portal
+chooser. Normal OpenCode use starts another process. Portal approval happens
+before MCP initialization, so the 90-second timeout is required. Restart or
+re-enable the MCP after revocation or stream loss; retrying a tool cannot create
+a new portal session.
 
 ## Direct commands
 
-These commands work without an MCP host:
+Use `open-computer-use help` for all commands. Common diagnostics are:
 
 ```sh
 open-computer-use doctor
 open-computer-use init
 open-computer-use list-apps
 open-computer-use snapshot APP
-open-computer-use call CALLS.json
-open-computer-use mcp
 ```
 
-`doctor`, `list-apps`, and `snapshot` do not open a portal chooser. `call`
-accepts one JSON call or a static array and keeps one runtime for that batch:
-
-```json
-[
-  {"name":"list_applications","arguments":{"scope":"running"}},
-  {"name":"observe","arguments":{"target":"KWrite","text_limit":500}}
-]
-```
-
-Static arrays cannot insert an opaque `state_id` returned by an earlier entry.
-Use MCP for observe-then-act workflows. Direct arrays are suitable for calls
-that do not depend on earlier output.
+`doctor`, `list-apps`, and `snapshot` do not open the portal chooser. The
+diagnostic `open-computer-use call FILE` batch interface is documented in
+[MCP.md](MCP.md#direct-call-command); it is not an MCP transport.
 
 ## Security and support
-
-AT-SPI can read text and trigger actions in apps within the graphical session.
-Screenshots contain the complete approved monitor. Run this server only for a
-trusted local MCP host and user.
 
 KDE Plasma Wayland is the maintained target. The project does not support X11,
 macOS, Windows, browser automation, or a standalone desktop UI.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), and
-[DEVELOPMENT.md](DEVELOPMENT.md) for the detailed contracts and development
-workflow.
+- [MCP.md](MCP.md): setup, tool contract, results, and troubleshooting
+- [SECURITY.md](SECURITY.md): threat model and residual risks
+- [ARCHITECTURE.md](ARCHITECTURE.md): implementation and invariants
+- [DEVELOPMENT.md](DEVELOPMENT.md): contributor workflow
