@@ -5,13 +5,13 @@ pub mod keyboard;
 pub mod keyboard_input;
 pub mod pointer;
 
-use crate::validation::{KeyboardAction, PointerAction};
+use crate::validation::{KeyboardAction, KeyboardFocus, PointerAction};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeneratedInputAction {
     Pointer(PointerAction),
     Keyboard {
-        focus: (f64, f64),
+        focus: KeyboardFocus,
         action: KeyboardAction,
     },
 }

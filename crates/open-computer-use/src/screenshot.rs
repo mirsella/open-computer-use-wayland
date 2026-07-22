@@ -6,17 +6,14 @@ use tokio::sync::Mutex;
 use crate::{
     accessibility::{ObjectId, Snapshot},
     capture::{CaptureBackend, CaptureSession, FrameMetadata, OwnedFrame, PipeWireCapture},
-    encoder::{self, PngMapping},
-    geometry::{MonitorGeometry, MonitorMapping, map_monitor},
+    encoder,
+    geometry::PixelRect,
     input::{
-        GeneratedInputAction,
-        backend::InputBackend,
-        coordinates::{EisRegion, ValidatedMapping},
-        eis::ReisInputBackend,
-        keyboard_input, pointer,
+        GeneratedInputAction, backend::InputBackend, coordinates::ValidatedMapping,
+        eis::ReisInputBackend, keyboard_input, pointer,
     },
     portal::{PortalBackend, PortalSessionLease, PortalStream, XdgPortalBackend},
-    validation::{KeyboardAction, PointerAction},
+    validation::{KeyboardFocus, PointerAction},
 };
 
 pub(crate) const SESSION_UNAVAILABLE: &str =
@@ -48,8 +45,7 @@ pub struct ScreenshotMapping {
     pub portal_session_generation: u64,
     pub stream: PortalStream,
     pub source: FrameMetadata,
-    pub monitor: MonitorMapping,
-    pub output: PngMapping,
+    pub output_size: (u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,7 +269,6 @@ where
                 "portal RemoteDesktop session closed".into(),
             ));
         }
-        let stream = &active.stream;
         let baseline = active
             .capture
             .latest_after(None, Duration::from_secs(2))
@@ -285,20 +280,22 @@ where
             .await
             .map_err(ScreenshotError)?;
         let source = frame.metadata;
-        let monitor = map_monitor(&MonitorGeometry {
-            position: stream.position,
-            logical_size: stream.logical_size,
-            frame_size: source.size,
-            frame_crop: source.crop,
-            transform: source.transform,
-        })
-        .map_err(ScreenshotError)?;
+        let (width, height) = if source.transform.swaps_axes() {
+            (source.crop.height, source.crop.width)
+        } else {
+            (source.crop.width, source.crop.height)
+        };
         let encoded = encoder::encode(
             frame.rgba,
             source.size,
             source.crop,
             source.transform,
-            monitor.transformed_crop,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
         )
         .map_err(ScreenshotError)?;
         if active.session.is_closed() {
@@ -315,10 +312,9 @@ where
                 accessibility_generation: snapshot.generation,
                 portal_session_identity: active.session.identity().to_owned(),
                 portal_session_generation: active.session.generation(),
-                stream: stream.clone(),
+                stream: active.stream.clone(),
                 source,
-                monitor,
-                output: encoded.mapping,
+                output_size: encoded.size,
             },
         })
     }
@@ -340,20 +336,13 @@ where
         ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         validate_current_capture(active, mapping).await?;
         let keyboard_required = matches!(action, GeneratedInputAction::Keyboard { .. });
-        let region = EisRegion {
-            position: mapping
-                .stream
-                .position
-                .ok_or_else(|| "selected monitor stream has no compositor position".to_owned())?,
-            size: mapping
-                .stream
-                .logical_size
-                .ok_or_else(|| "selected monitor stream has no logical size".to_owned())?,
-            mapping_id: mapping.stream.mapping_id.clone(),
-        };
         let connected_now = active.input.is_none();
         if connected_now {
-            match ReisInputBackend::connect(Arc::clone(&active.session), region).await {
+            let mapping_id = mapping.stream.mapping_id.clone().ok_or_else(|| {
+                "monitor stream omitted mapping_id; generated input cannot be bound to the approved monitor"
+                    .to_owned()
+            })?;
+            match ReisInputBackend::connect(Arc::clone(&active.session), mapping_id).await {
                 Ok(input) => active.input = Some(input),
                 Err(error) => {
                     exhaust_capture(&mut state, "EIS setup failed").await;
@@ -374,7 +363,11 @@ where
         let region = input.wait_for_action(keyboard_required).await?;
         ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?
             .eis_mapper(region)?;
-        require_action_capabilities(input.as_ref(), action)
+        require_action_capabilities(input.as_ref(), action)?;
+        if let GeneratedInputAction::Keyboard { action, .. } = action {
+            keyboard_input::preflight(input, action)?;
+        }
+        Ok(())
     }
 
     async fn perform_input<'a>(
@@ -392,7 +385,14 @@ where
             return Err(SESSION_UNAVAILABLE.into());
         }
         ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
-        if let Err(error) = validate_current_capture(active, mapping).await {
+        let semantic_keyboard = matches!(
+            &action,
+            GeneratedInputAction::Keyboard {
+                focus: KeyboardFocus::Element(_),
+                ..
+            }
+        );
+        if !semantic_keyboard && let Err(error) = validate_current_capture(active, mapping).await {
             eprintln!("open-computer-use: invalidating capture before input: {error}");
             exhaust_capture(&mut state, "capture validation failed before input").await;
             return Err(error);
@@ -442,15 +442,11 @@ where
                 }
             },
             GeneratedInputAction::Keyboard { focus, action } => {
-                let focus = mapper.point(focus.0, focus.1)?;
-                match action {
-                    KeyboardAction::Press(key) => {
-                        keyboard_input::press_key(input.clone(), focus, &key).await?
-                    }
-                    KeyboardAction::Type(text) => {
-                        keyboard_input::type_text(input.clone(), focus, &text).await?
-                    }
-                }
+                let focus = match focus {
+                    KeyboardFocus::Point((x, y)) => Some(mapper.point(x, y)?),
+                    KeyboardFocus::Element(_) => None,
+                };
+                keyboard_input::perform(input, focus, action).await?;
             }
         }
         if active.session.is_closed() {
@@ -578,19 +574,17 @@ fn require_action_capabilities(
     backend: &ReisInputBackend,
     action: &GeneratedInputAction,
 ) -> Result<(), String> {
-    let capabilities = backend.capabilities()?;
-    let available = match action {
-        GeneratedInputAction::Pointer(PointerAction::Move { .. }) => true,
+    let (button, scroll, keyboard) = match action {
+        GeneratedInputAction::Pointer(PointerAction::Move { .. }) => (false, false, false),
         GeneratedInputAction::Pointer(PointerAction::Click { .. } | PointerAction::Drag { .. }) => {
-            capabilities.button
+            (true, false, false)
         }
-        GeneratedInputAction::Pointer(PointerAction::Scroll { .. }) => capabilities.scroll,
-        GeneratedInputAction::Keyboard { .. } => capabilities.button && capabilities.keyboard,
+        GeneratedInputAction::Pointer(PointerAction::Scroll { .. }) => (false, true, false),
+        GeneratedInputAction::Keyboard { focus, .. } => {
+            (matches!(focus, KeyboardFocus::Point(_)), false, true)
+        }
     };
-    if !available {
-        return Err("EIS backend lacks the device capabilities required for this action".into());
-    }
-    Ok(())
+    backend.require_capabilities(button, scroll, keyboard)
 }
 
 #[cfg(test)]
@@ -786,6 +780,8 @@ mod tests {
         };
         Snapshot {
             app_query: "test".into(),
+            view: crate::validation::ObservationView::Full,
+            element_query: None,
             app: AppInfo {
                 object: ObjectId {
                     bus_name: ":1.5".into(),
@@ -856,14 +852,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_binds_frame_and_session_identity() {
-        let (connection, _) = test_connection(9, 44);
+    async fn coordinator_binds_frame_and_session_identity_without_portal_logical_size() {
+        let (mut connection, _) = test_connection(9, 44);
+        connection.stream.logical_size = None;
         let capture_state = Arc::new(FakeCaptureState::default());
         let coordinator = test_coordinator([connection], capture_state);
         coordinator.prepare().await.unwrap();
         let observation = coordinator.capture(&test_snapshot()).await.unwrap();
         assert_eq!(observation.mapping.source.generation, 2);
         assert_eq!(observation.mapping.portal_session_generation, 9);
+        assert_eq!(observation.mapping.output_size, (2, 2));
         let matching = OwnedFrame {
             metadata: FrameMetadata {
                 generation: observation.mapping.source.generation + 1,
@@ -886,5 +884,34 @@ mod tests {
                 .unwrap_err()
                 .contains("renegotiated")
         );
+    }
+
+    #[tokio::test]
+    async fn capture_succeeds_without_portal_global_position() {
+        let (mut connection, _) = test_connection(9, 44);
+        connection.stream.position = None;
+        let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
+        coordinator.prepare().await.unwrap();
+        let observation = coordinator.capture(&test_snapshot()).await.unwrap();
+        assert_eq!(observation.mapping.stream.position, None);
+    }
+
+    #[tokio::test]
+    async fn generated_input_requires_monitor_mapping_id() {
+        let (mut connection, _) = test_connection(9, 44);
+        connection.stream.mapping_id = None;
+        let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
+        coordinator.prepare().await.unwrap();
+        let snapshot = test_snapshot();
+        let observation = coordinator.capture(&snapshot).await.unwrap();
+        let error = coordinator
+            .prepare_input(
+                &snapshot,
+                &observation.mapping,
+                &GeneratedInputAction::Pointer(PointerAction::Move { x: 0.0, y: 0.0 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("omitted mapping_id"));
     }
 }

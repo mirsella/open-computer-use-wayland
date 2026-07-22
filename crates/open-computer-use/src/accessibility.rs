@@ -16,7 +16,10 @@ use crate::{
     input::GeneratedInputAction,
     runtime::{DesktopRuntime, ToolOutput},
     screenshot::{NoScreenshots, SESSION_UNAVAILABLE, ScreenshotMapping, ScreenshotProvider},
-    validation::{ApplicationScope, ElementAction, MAX_TEXT_LIMIT, TextLimit, ToolCall},
+    validation::{
+        ApplicationScope, ElementAction, KeyboardFocus, MAX_TEXT_LIMIT, ObservationView, TextLimit,
+        ToolCall,
+    },
 };
 
 pub const EMPTY_APPS_MESSAGE: &str = "No running applications with accessible windows found.";
@@ -233,6 +236,8 @@ pub struct SnapshotLimits {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub app_query: String,
+    pub view: ObservationView,
+    pub element_query: Option<String>,
     pub app: AppInfo,
     pub window: WindowInfo,
     pub generation: u64,
@@ -251,7 +256,141 @@ struct CachedObservation {
 #[derive(Debug, Default)]
 struct Cache {
     generation: u64,
-    current: Option<CachedObservation>,
+    observations: Vec<CachedObservation>,
+}
+
+const MAX_CACHED_OBSERVATIONS: usize = 8;
+const MAX_CACHED_SNAPSHOT_STRING_BYTES: usize = 8 * 1024 * 1024;
+
+impl Cache {
+    fn insert(&mut self, mut snapshot: Snapshot) -> Result<Arc<Snapshot>, RuntimeError> {
+        if snapshot_string_bytes(&snapshot) > MAX_CACHED_SNAPSHOT_STRING_BYTES {
+            return Err(operational_error(
+                "observation exceeds the retained-state byte limit; lower text_limit or max_tree_nodes",
+            ));
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| operational_error("snapshot generation overflow"))?;
+        snapshot.generation = self.generation;
+        let snapshot = Arc::new(snapshot);
+        self.observations
+            .retain(|cached| !same_target(&cached.snapshot, &snapshot));
+        self.observations.push(CachedObservation {
+            snapshot: Arc::clone(&snapshot),
+            screenshot_mapping: None,
+        });
+        while self.observations.len() > MAX_CACHED_OBSERVATIONS
+            || self
+                .observations
+                .iter()
+                .map(|cached| snapshot_string_bytes(&cached.snapshot))
+                .sum::<usize>()
+                > MAX_CACHED_SNAPSHOT_STRING_BYTES
+        {
+            self.observations.remove(0);
+        }
+        Ok(snapshot)
+    }
+
+    fn required(&self, state_id: &str) -> Result<&CachedObservation, RuntimeError> {
+        self.observations
+            .iter()
+            .find(|cached| snapshot_state_id(&cached.snapshot) == state_id)
+            .ok_or_else(|| {
+                if self.observations.is_empty() {
+                    state_required_error("no observation is available; call observe first")
+                } else {
+                    stale_state_error(format!("state_id {state_id:?} is stale"))
+                }
+            })
+    }
+
+    fn position(&self, expected: &Snapshot) -> Result<usize, RuntimeError> {
+        let position = self
+            .observations
+            .iter()
+            .position(|cached| cached.snapshot.generation == expected.generation)
+            .ok_or_else(|| {
+                state_required_error("state cache lost the observation before action dispatch")
+            })?;
+        if !same_target(&self.observations[position].snapshot, expected) {
+            return Err(stale_state_error(
+                "state changed before action dispatch; call observe again",
+            ));
+        }
+        Ok(position)
+    }
+
+    fn invalidate_for_mutation(&mut self, expected: &Snapshot) -> Result<(), RuntimeError> {
+        let position = self.position(expected)?;
+        self.observations.remove(position);
+        self.clear_screenshot_mappings();
+        Ok(())
+    }
+
+    fn clear_screenshot_mappings(&mut self) {
+        for cached in &mut self.observations {
+            cached.screenshot_mapping = None;
+        }
+    }
+}
+
+fn same_target(left: &Snapshot, right: &Snapshot) -> bool {
+    left.app.pid == right.app.pid
+        && left.app.object == right.app.object
+        && left.window.object == right.window.object
+}
+
+fn object_string_bytes(object: &ObjectId) -> usize {
+    object.bus_name.len() + object.path.len()
+}
+
+fn window_string_bytes(window: &WindowInfo) -> usize {
+    object_string_bytes(&window.object)
+        + window.title.len()
+        + window.states.iter().map(String::len).sum::<usize>()
+        + window.states.len() * std::mem::size_of::<String>()
+}
+
+fn app_string_bytes(app: &AppInfo) -> usize {
+    object_string_bytes(&app.object)
+        + app.name.len()
+        + app.windows.iter().map(window_string_bytes).sum::<usize>()
+        + std::mem::size_of_val(app.windows.as_slice())
+}
+
+fn node_string_bytes(node: &NodeInfo) -> usize {
+    object_string_bytes(&node.object)
+        + node.role.len()
+        + node.name.len()
+        + node.value.as_ref().map_or(0, String::len)
+        + node.text.as_ref().map_or(0, String::len)
+        + node.selected_text.as_ref().map_or(0, String::len)
+        + node.states.iter().map(String::len).sum::<usize>()
+        + node
+            .capabilities
+            .actions()
+            .iter()
+            .map(|action| action.name.len() + action.description.len())
+            .sum::<usize>()
+        + node.children.iter().map(object_string_bytes).sum::<usize>()
+        + node.states.len() * std::mem::size_of::<String>()
+        + std::mem::size_of_val(node.capabilities.actions())
+        + std::mem::size_of_val(node.children.as_slice())
+}
+
+fn snapshot_string_bytes(snapshot: &Snapshot) -> usize {
+    snapshot.app_query.len()
+        + snapshot.element_query.as_ref().map_or(0, String::len)
+        + app_string_bytes(&snapshot.app)
+        + window_string_bytes(&snapshot.window)
+        + snapshot
+            .elements
+            .iter()
+            .map(|element| node_string_bytes(&element.node))
+            .sum::<usize>()
 }
 
 pub struct SemanticRuntime<A, S = NoScreenshots> {
@@ -345,7 +484,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     ) -> Result<String, RuntimeError> {
         let _mutation = self.mutation.lock().await;
         let snapshot = self
-            .requested_snapshot(app_query, text_limit, max_nodes, max_depth)
+            .requested_snapshot(
+                app_query,
+                ObservationView::Full,
+                None,
+                text_limit,
+                max_nodes,
+                max_depth,
+            )
             .await?;
         Ok(format!(
             "{}\nScreenshot unavailable: capture was not requested by the text-only API.",
@@ -358,7 +504,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ToolCall::ListApplications { .. } => self.execute_call_inner(call).await,
             ToolCall::LaunchApplication { desktop_id } => {
                 let _mutation = self.mutation.lock().await;
-                self.lock_cache()?.current = None;
+                self.lock_cache()?.observations.clear();
                 let launched = crate::desktop_launcher::launch(
                     &desktop_id,
                     Arc::clone(&self.launch_in_progress),
@@ -389,12 +535,21 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ToolCall::ListApplications { scope } => self.list_applications(scope).await,
             ToolCall::Observe {
                 target,
+                view,
+                query,
                 text_limit,
                 max_tree_nodes,
                 max_tree_depth,
             } => {
                 let snapshot = self
-                    .requested_snapshot(target, text_limit, max_tree_nodes, max_tree_depth)
+                    .requested_snapshot(
+                        target,
+                        view,
+                        query,
+                        text_limit,
+                        max_tree_nodes,
+                        max_tree_depth,
+                    )
                     .await?;
                 Ok(self.observe(snapshot).await)
             }
@@ -481,55 +636,58 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         })?
     }
 
-    async fn snapshot_and_cache(
-        &self,
-        app_query: String,
-        limits: SnapshotLimits,
-    ) -> Result<Arc<Snapshot>, RuntimeError> {
-        let future = self.collect_snapshot(app_query.clone(), None, limits);
-        let snapshot = timeout(self.config.snapshot_timeout, future)
-            .await
-            .map_err(|_| operational_error("AT-SPI snapshot timed out"))??;
-        self.commit_snapshot(snapshot)
-    }
-
-    fn commit_snapshot(&self, mut snapshot: Snapshot) -> Result<Arc<Snapshot>, RuntimeError> {
-        let mut cache = self.lock_cache()?;
-        cache.generation = cache
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| operational_error("snapshot generation overflow"))?;
-        snapshot.generation = cache.generation;
-        let snapshot = Arc::new(snapshot);
-        cache.current = Some(CachedObservation {
-            snapshot: Arc::clone(&snapshot),
-            screenshot_mapping: None,
-        });
-        Ok(snapshot)
+    fn commit_snapshot(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, RuntimeError> {
+        self.lock_cache()?.insert(snapshot)
     }
 
     async fn collect_snapshot(
         &self,
         app_query: String,
         expected_pid: Option<u32>,
+        expected_window: Option<&ObjectId>,
+        view: ObservationView,
+        element_query: Option<String>,
         limits: SnapshotLimits,
     ) -> Result<Snapshot, RuntimeError> {
         let apps = self.discover().await?;
         let resolved = resolve_app(&app_query, expected_pid, &apps)?;
-        let window = if let Some(window) = resolved.window {
-            if !window_is_viable(&window) {
-                return Err(operational_error(format!(
-                    "matched window {:?} is stale or defunct",
-                    window.title
-                )));
-            }
+        let window = if let Some(expected_window) = expected_window {
+            resolved
+                .app
+                .windows
+                .iter()
+                .find(|window| &window.object == expected_window)
+                .cloned()
+                .ok_or_else(|| {
+                    operational_error("cached window is no longer present in the target app")
+                })?
+        } else if let Some(window) = resolved.window {
             window
         } else {
             choose_window(&resolved.app.windows)?.clone()
         };
-        let elements = self.traverse(&window, limits).await?;
+        if !window_is_viable(&window) {
+            return Err(operational_error(format!(
+                "matched window {:?} is stale or defunct",
+                window.title
+            )));
+        }
+        let metadata_bytes = app_query.len()
+            + element_query.as_ref().map_or(0, String::len)
+            + app_string_bytes(&resolved.app)
+            + window_string_bytes(&window);
+        let element_budget = MAX_CACHED_SNAPSHOT_STRING_BYTES
+            .checked_sub(metadata_bytes)
+            .ok_or_else(|| {
+                operational_error(
+                    "observation metadata exceeds the retained-state byte limit; use a narrower target",
+                )
+            })?;
+        let elements = self.traverse(&window, view, limits, element_budget).await?;
         Ok(Snapshot {
             app_query,
+            view,
+            element_query,
             app: resolved.app,
             window,
             generation: 0,
@@ -543,12 +701,15 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     async fn traverse(
         &self,
         window: &WindowInfo,
+        view: ObservationView,
         limits: SnapshotLimits,
+        string_byte_budget: usize,
     ) -> Result<Traversal, RuntimeError> {
         let mut stack = vec![(window.object.clone(), 0_usize)];
         let mut elements = Vec::new();
         let mut node_limit_reached = false;
         let mut depth_limit_reached = false;
+        let mut string_bytes = 0_usize;
         while let Some((object, depth)) = stack.pop() {
             if elements.len() >= limits.nodes {
                 node_limit_reached = true;
@@ -584,6 +745,17 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 );
                 continue;
             }
+            if depth > 0 && view != ObservationView::Full && is_hidden_document(&node) {
+                continue;
+            }
+            string_bytes = string_bytes
+                .checked_add(node_string_bytes(&node))
+                .filter(|bytes| *bytes <= string_byte_budget)
+                .ok_or_else(|| {
+                    operational_error(
+                        "observation exceeds the retained-state byte limit; lower text_limit or max_tree_nodes",
+                    )
+                })?;
             node.window_frame = normalize_frame(&node);
             let children = node.children.clone();
             elements.push(ElementSnapshot { depth, node });
@@ -620,20 +792,15 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 return Err(operational_error("target element is defunct"));
             }
             Ok(_) => {}
-            Err(error) => {
-                eprintln!(
-                    "open-computer-use: cached AT-SPI object path is stale; trying strict relocation: {error}"
-                );
-            }
+            Err(error) => eprintln!(
+                "open-computer-use: cached AT-SPI object is stale; attempting strict relocation: {error}"
+            ),
         }
         let current = self.fresh_for_action(&cached).await?;
         let target = relocate(old_element, &current.elements)?;
-        if target.node.is_defunct() {
-            return Err(operational_error("target element is defunct"));
-        }
+        ensure_element_presented(&current, target, index)?;
         let semantic = semantic_action(action, target)?;
-        self.require_latest_generation(&cached)?;
-        self.invalidate_current(&cached)?;
+        self.lock_cache()?.invalidate_for_mutation(&cached)?;
         timeout(
             self.config.call_timeout,
             self.adapter.act(&target.node.object, semantic),
@@ -653,31 +820,36 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             nodes: self.config.default_max_nodes.max(cached.elements.len()),
             depth: self.config.default_max_depth,
         };
-        let current = self
-            .collect_snapshot(cached.app_query.clone(), Some(cached.app.pid), limits)
-            .await?;
-        if current.app.pid != cached.app.pid {
-            return Err(operational_error(format!(
-                "stale PID: snapshot had {}, current app has {}",
-                cached.app.pid, current.app.pid
-            )));
-        }
+        let current = self.collect_exact_snapshot(cached, limits).await?;
         if current.app.object != cached.app.object {
             return Err(operational_error(
                 "application identity changed since the prior state",
             ));
         }
-        if current.window.object != cached.window.object {
-            return Err(operational_error(
-                "window identity changed since the prior state",
-            ));
-        }
         Ok(current)
+    }
+
+    async fn collect_exact_snapshot(
+        &self,
+        cached: &Snapshot,
+        limits: SnapshotLimits,
+    ) -> Result<Snapshot, RuntimeError> {
+        self.collect_snapshot(
+            cached.app_query.clone(),
+            Some(cached.app.pid),
+            Some(&cached.window.object),
+            cached.view,
+            cached.element_query.clone(),
+            limits,
+        )
+        .await
     }
 
     async fn requested_snapshot(
         &self,
         app_query: String,
+        view: ObservationView,
+        element_query: Option<String>,
         text_limit: Option<TextLimit>,
         max_nodes: Option<usize>,
         max_depth: Option<usize>,
@@ -687,15 +859,22 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             Some(TextLimit::Max) => MAX_TEXT_LIMIT,
             None => self.config.default_text_limit,
         };
-        self.snapshot_and_cache(
+        let future = self.collect_snapshot(
             app_query,
+            None,
+            None,
+            view,
+            element_query,
             SnapshotLimits {
                 text,
                 nodes: max_nodes.unwrap_or(self.config.default_max_nodes),
                 depth: max_depth.unwrap_or(self.config.default_max_depth),
             },
-        )
-        .await
+        );
+        let snapshot = timeout(self.config.snapshot_timeout, future)
+            .await
+            .map_err(|_| operational_error("AT-SPI snapshot timed out"))??;
+        self.commit_snapshot(snapshot)
     }
 
     async fn perform_generated(
@@ -704,8 +883,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         action: GeneratedInputAction,
     ) -> Result<ToolOutput, RuntimeError> {
         let (cached, mapping) = self.required_screenshot(state_id)?;
-        self.fresh_for_action(&cached).await?;
-        self.require_latest_generation(&cached)?;
+        let current = self.fresh_for_action(&cached).await?;
+        semantic_focus_plan(&action, &cached, &current)?;
+        self.lock_cache()?.position(&cached)?;
         let preparation = timeout(
             self.config.snapshot_timeout,
             self.screenshots.prepare_input(&cached, &mapping, &action),
@@ -731,9 +911,23 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 "generated input preparation cleanup failed: {error}"
             ))
         })?;
-        self.fresh_for_action(&cached).await?;
-        self.require_latest_generation(&cached)?;
-        self.invalidate_current(&cached)?;
+        let current = self.fresh_for_action(&cached).await?;
+        let semantic_focus = semantic_focus_plan(&action, &cached, &current)?;
+        self.lock_cache()?.invalidate_for_mutation(&cached)?;
+        if let Some((index, object)) = semantic_focus {
+            timeout(
+                self.config.call_timeout,
+                self.adapter.act(&object, SemanticAction::GrabFocus),
+            )
+            .await
+            .map_err(|_| operational_error("AT-SPI semantic keyboard focus timed out"))
+            .and_then(|result| result)
+            .map_err(uncertain_action)?;
+            sleep(self.config.settle_interval).await;
+            self.verify_semantic_keyboard_focus(&cached, index)
+                .await
+                .map_err(uncertain_action)?;
+        }
         let result = timeout(
             self.config.snapshot_timeout,
             self.screenshots.perform_input(&cached, &mapping, action),
@@ -772,17 +966,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     async fn settle_and_refresh(&self, old: Arc<Snapshot>) -> Result<Arc<Snapshot>, RuntimeError> {
         sleep(self.config.settle_interval).await;
-        let future = self.collect_snapshot(old.app_query.clone(), Some(old.app.pid), old.limits);
+        let future = self.collect_exact_snapshot(&old, old.limits);
         let refreshed = timeout(self.config.snapshot_timeout, future)
             .await
             .map_err(|_| operational_error("AT-SPI snapshot timed out after action"))??;
-        if refreshed.app.pid != old.app.pid
-            || refreshed.app.object != old.app.object
-            || refreshed.window.object != old.window.object
-        {
-            eprintln!("open-computer-use: app or window changed after action");
+        if refreshed.app.object != old.app.object {
             return Err(operational_error(
-                "app or window changed while settling after the action",
+                "application identity changed while settling after the action",
             ));
         }
         self.commit_snapshot(refreshed)
@@ -813,7 +1003,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         };
         if preparation.consent_interrupted_observation {
             snapshot = match self
-                .snapshot_and_cache(snapshot.app_query.clone(), snapshot.limits)
+                .requested_snapshot(
+                    snapshot.app_query.clone(),
+                    snapshot.view,
+                    snapshot.element_query.clone(),
+                    Some(TextLimit::Count(snapshot.limits.text)),
+                    Some(snapshot.limits.nodes),
+                    Some(snapshot.limits.depth),
+                )
                 .await
             {
                 Ok(refreshed) => refreshed,
@@ -867,7 +1064,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     );
                     return screenshot_unavailable(&snapshot, &error.to_string());
                 }
-                let (width, height) = observation.mapping.output.size;
+                let (width, height) = observation.mapping.output_size;
                 observation_output(
                     &snapshot,
                     true,
@@ -926,23 +1123,11 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         mapping: ScreenshotMapping,
     ) -> Result<(), RuntimeError> {
         let mut cache = self.lock_cache()?;
-        let cached = cache.current.as_mut().ok_or_else(|| {
-            state_required_error("state cache lost the observation during screenshot capture")
+        let position = cache.position(snapshot).map_err(|error| {
+            eprintln!("open-computer-use: refusing stale screenshot cache write: {error}");
+            error
         })?;
-        if cached.snapshot.generation != snapshot.generation
-            || cached.snapshot.app.pid != snapshot.app.pid
-            || cached.snapshot.app.object != snapshot.app.object
-            || cached.snapshot.window.object != snapshot.window.object
-        {
-            eprintln!(
-                "open-computer-use: refusing stale screenshot cache write: cached_generation={} captured_generation={}",
-                cached.snapshot.generation, snapshot.generation
-            );
-            return Err(stale_state_error(
-                "state generation changed during screenshot capture",
-            ));
-        }
-        cached.screenshot_mapping = Some(mapping);
+        cache.observations[position].screenshot_mapping = Some(mapping);
         Ok(())
     }
 
@@ -951,25 +1136,16 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         state_id: &str,
     ) -> Result<Option<ScreenshotMapping>, RuntimeError> {
         let cache = self.lock_cache()?;
-        Ok(cache.current.as_ref().and_then(|current| {
-            (snapshot_state_id(&current.snapshot) == state_id)
-                .then(|| current.screenshot_mapping.clone())
-                .flatten()
-        }))
+        Ok(cache
+            .observations
+            .iter()
+            .find(|cached| snapshot_state_id(&cached.snapshot) == state_id)
+            .and_then(|cached| cached.screenshot_mapping.clone()))
     }
 
     fn required_cached(&self, state_id: &str) -> Result<Arc<Snapshot>, RuntimeError> {
         let cache = self.lock_cache()?;
-        let current = cache.current.as_ref().ok_or_else(|| {
-            state_required_error("no observation is available; call observe first")
-        })?;
-        if snapshot_state_id(&current.snapshot) != state_id {
-            return Err(stale_state_error(format!(
-                "state_id {state_id:?} is stale; current state_id is {:?}",
-                snapshot_state_id(&current.snapshot)
-            )));
-        }
-        Ok(Arc::clone(&current.snapshot))
+        Ok(Arc::clone(&cache.required(state_id)?.snapshot))
     }
 
     fn required_screenshot(
@@ -977,15 +1153,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         state_id: &str,
     ) -> Result<(Arc<Snapshot>, ScreenshotMapping), RuntimeError> {
         let cache = self.lock_cache()?;
-        let current = cache.current.as_ref().ok_or_else(|| {
-            state_required_error("no observation is available; call observe first")
-        })?;
-        if snapshot_state_id(&current.snapshot) != state_id {
-            return Err(stale_state_error(format!(
-                "state_id {state_id:?} is stale; current state_id is {:?}",
-                snapshot_state_id(&current.snapshot)
-            )));
-        }
+        let current = cache.required(state_id)?;
         let mapping = current.screenshot_mapping.clone().ok_or_else(|| {
             state_required_error(
                 "the observation has no usable screenshot; call observe and require screenshot.ready=true",
@@ -994,36 +1162,23 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         Ok((Arc::clone(&current.snapshot), mapping))
     }
 
-    fn require_latest_generation(&self, expected: &Snapshot) -> Result<(), RuntimeError> {
-        let latest = self.required_cached(&snapshot_state_id(expected))?;
-        if latest.generation != expected.generation
-            || latest.app.pid != expected.app.pid
-            || latest.app.object != expected.app.object
-            || latest.window.object != expected.window.object
-        {
-            return Err(stale_state_error(format!(
-                "stale mutation plan: expected generation {}, latest generation {}",
-                expected.generation, latest.generation
-            )));
-        }
-        Ok(())
-    }
-
-    fn invalidate_current(&self, expected: &Snapshot) -> Result<(), RuntimeError> {
-        let mut cache = self.lock_cache()?;
-        let current = cache.current.as_ref().ok_or_else(|| {
-            state_required_error("state cache lost the observation before action dispatch")
-        })?;
-        if current.snapshot.generation != expected.generation
-            || current.snapshot.app.pid != expected.app.pid
-            || current.snapshot.app.object != expected.app.object
-            || current.snapshot.window.object != expected.window.object
-        {
-            return Err(stale_state_error(
-                "state changed before action dispatch; call observe again",
+    async fn verify_semantic_keyboard_focus(
+        &self,
+        cached: &Snapshot,
+        index: &str,
+    ) -> Result<(), RuntimeError> {
+        let current = self.fresh_for_action(cached).await?;
+        let target = relocated_element(cached, &current, index)?;
+        if !target.node.states.contains("focused") {
+            return Err(operational_error(
+                "semantic keyboard focus target is not focused after GrabFocus",
             ));
         }
-        cache.current = None;
+        if !current.window.states.contains("active") {
+            return Err(operational_error(
+                "selected window is not active after semantic keyboard focus",
+            ));
+        }
         Ok(())
     }
 
@@ -1045,6 +1200,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> DesktopRuntime for Semantic
 
     async fn cleanup(&self) -> Result<(), RuntimeError> {
         let _mutation = self.mutation.lock().await;
+        self.lock_cache()?.clear_screenshot_mappings();
         self.screenshots
             .cleanup_input()
             .await
@@ -1191,6 +1347,13 @@ fn normalize_frame(node: &NodeInfo) -> Option<Rect> {
     node.window_frame.filter(|frame| frame.is_valid())
 }
 
+fn is_hidden_document(node: &NodeInfo) -> bool {
+    node.role.to_ascii_lowercase().contains("document")
+        && !node.states.contains("showing")
+        && !node.states.contains("active")
+        && !node.states.contains("focused")
+}
+
 fn relocate<'a>(
     old: &ElementSnapshot,
     current: &'a [ElementSnapshot],
@@ -1313,11 +1476,20 @@ fn primary_action_index(actions: &[ActionInfo]) -> Option<usize> {
     const PREFERRED: [&str; 8] = [
         "click", "press", "activate", "invoke", "select", "toggle", "open", "default",
     ];
-    PREFERRED.iter().find_map(|preferred| {
-        actions
-            .iter()
-            .position(|action| action.name.eq_ignore_ascii_case(preferred))
-    })
+    PREFERRED
+        .iter()
+        .find_map(|preferred| {
+            actions
+                .iter()
+                .position(|action| action.name.eq_ignore_ascii_case(preferred))
+        })
+        .or_else(|| {
+            (actions.len() == 1
+                && actions.iter().all(|action| {
+                    action.name.trim().is_empty() && action.description.trim().is_empty()
+                }))
+            .then_some(0)
+        })
 }
 
 pub fn format_snapshot(snapshot: &Snapshot) -> String {
@@ -1328,9 +1500,16 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
         snapshot.app.pid,
         escape(&snapshot.window.title)
     );
+    if snapshot.view != ObservationView::Full || snapshot.element_query.is_some() {
+        output.push_str(&format!("View: {}", snapshot.view.as_str()));
+        if let Some(query) = &snapshot.element_query {
+            output.push_str(&format!(" query=\"{}\"", escape(query)));
+        }
+        output.push('\n');
+    }
     let mut focused = None;
     let mut selected = None;
-    for (index, element) in snapshot.elements.iter().enumerate() {
+    for (index, element) in presented_elements(snapshot) {
         let indent = "\t".repeat(element.depth + 1);
         output.push_str(&format!(
             "{indent}{}: {} name=\"{}\"",
@@ -1492,6 +1671,13 @@ fn element_capabilities(index: usize, element: &ElementSnapshot) -> serde_json::
     let actions = element.node.capabilities.actions();
     json!({
         "element_id": index.to_string(),
+        "depth": element.depth,
+        "role": element.node.role,
+        "name": element.node.name,
+        "states": element.node.states.iter().collect::<Vec<_>>(),
+        "frame_atspi_window": element.node.window_frame.map(|frame| {
+            json!({"x": frame.x, "y": frame.y, "width": frame.width, "height": frame.height})
+        }),
         "inspection_complete": inspection_complete,
         "invoke": inspection_complete && primary_action_index(actions).is_some(),
         "focus": element.node.capabilities.supports_focus(),
@@ -1540,12 +1726,14 @@ fn observation_output(
                 "object": object_metadata(&snapshot.window.object)
             }
         },
+        "view": snapshot.view.as_str(),
+        "element_query": snapshot.element_query,
         "screenshot": screenshot,
         "coordinate_spaces": {
             "screenshot": "screenshot_png_pixels",
             "element_frames": "atspi_window_coordinates"
         },
-        "elements": snapshot.elements.iter().enumerate().map(|(index, element)| {
+        "elements": presented_elements(snapshot).map(|(index, element)| {
             element_capabilities(index, element)
         }).collect::<Vec<_>>()
     });
@@ -1561,6 +1749,80 @@ fn observation_output(
         output = output.with_png_base64(png);
     }
     output
+}
+
+fn presented_elements(snapshot: &Snapshot) -> impl Iterator<Item = (usize, &ElementSnapshot)> {
+    let query = snapshot.element_query.as_deref().map(str::to_lowercase);
+    snapshot
+        .elements
+        .iter()
+        .enumerate()
+        .filter(move |(_, element)| {
+            element_is_presented_with_query(snapshot.view, query.as_deref(), element)
+        })
+}
+
+fn element_is_presented_with_query(
+    view: ObservationView,
+    query: Option<&str>,
+    element: &ElementSnapshot,
+) -> bool {
+    (view != ObservationView::Interactive || is_interactive(element))
+        && query.is_none_or(|query| element_matches_query(element, query))
+}
+
+fn is_interactive(element: &ElementSnapshot) -> bool {
+    if !element.node.capabilities.actions().is_empty()
+        || element.node.capabilities.set_value_kind().is_some()
+    {
+        return true;
+    }
+    const ROLES: [&str; 13] = [
+        "button",
+        "check box",
+        "combo box",
+        "entry",
+        "link",
+        "list item",
+        "menu item",
+        "page tab",
+        "radio button",
+        "slider",
+        "spin button",
+        "switch",
+        "toggle button",
+    ];
+    ROLES
+        .iter()
+        .any(|role| element.node.role.eq_ignore_ascii_case(role))
+        || element.node.states.iter().any(|state| {
+            matches!(
+                state.as_str(),
+                "checkable" | "editable" | "focusable" | "selectable"
+            )
+        })
+}
+
+fn element_matches_query(element: &ElementSnapshot, query: &str) -> bool {
+    [
+        Some(element.node.role.as_str()),
+        Some(element.node.name.as_str()),
+        element.node.value.as_deref(),
+        element.node.text.as_deref(),
+        element.node.selected_text.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.to_lowercase().contains(query))
+        || element
+            .node
+            .states
+            .iter()
+            .any(|state| state.to_lowercase().contains(query))
+        || element.node.capabilities.actions().iter().any(|action| {
+            action.name.to_lowercase().contains(query)
+                || action.description.to_lowercase().contains(query)
+        })
 }
 
 fn escape(value: &str) -> String {
@@ -1673,7 +1935,49 @@ fn cached_element<'a>(
             snapshot.generation
         ))
     })?;
+    ensure_element_presented(snapshot, element, index)?;
     Ok(element)
+}
+
+fn ensure_element_presented(
+    snapshot: &Snapshot,
+    element: &ElementSnapshot,
+    index: &str,
+) -> Result<(), RuntimeError> {
+    let query = snapshot.element_query.as_deref().map(str::to_lowercase);
+    if element_is_presented_with_query(snapshot.view, query.as_deref(), element) {
+        return Ok(());
+    }
+    Err(operational_error(format!(
+        "element_id {index} is no longer included in this observation view"
+    )))
+}
+
+fn relocated_element<'a>(
+    cached: &Snapshot,
+    current: &'a Snapshot,
+    index: &str,
+) -> Result<&'a ElementSnapshot, RuntimeError> {
+    let target = relocate(cached_element(cached, index)?, &current.elements)?;
+    ensure_element_presented(current, target, index)?;
+    Ok(target)
+}
+
+fn semantic_focus_plan<'a>(
+    action: &'a GeneratedInputAction,
+    cached: &Snapshot,
+    current: &Snapshot,
+) -> Result<Option<(&'a str, ObjectId)>, RuntimeError> {
+    let GeneratedInputAction::Keyboard {
+        focus: KeyboardFocus::Element(index),
+        ..
+    } = action
+    else {
+        return Ok(None);
+    };
+    let target = relocated_element(cached, current, index)?;
+    semantic_action(ElementAction::Focus, target)?;
+    Ok(Some((index, target.node.object.clone())))
 }
 
 #[cfg(test)]
@@ -1783,6 +2087,8 @@ mod tests {
         ]));
         let snapshot = Snapshot {
             app_query: "Editor".into(),
+            view: ObservationView::Full,
+            element_query: None,
             app: app("Editor", 1, "Main"),
             window: window("Main", &["active"]),
             generation: 2,
@@ -1807,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn click_uses_only_a_recognized_primary_action() {
+    fn click_uses_a_recognized_primary_or_single_unnamed_fallback() {
         let mut target = element(node("button", "button", "Menu"), 1, None);
         target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![
             ActionInfo {
@@ -1823,6 +2129,30 @@ mod tests {
             semantic_action(ElementAction::Invoke, &target).unwrap(),
             SemanticAction::InvokeAction(1)
         );
+        target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
+            name: String::new(),
+            description: String::new(),
+        }]));
+        assert_eq!(
+            semantic_action(ElementAction::Invoke, &target).unwrap(),
+            SemanticAction::InvokeAction(0)
+        );
+        target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![
+            ActionInfo {
+                name: String::new(),
+                description: String::new(),
+            },
+            ActionInfo {
+                name: String::new(),
+                description: String::new(),
+            },
+        ]));
+        assert!(semantic_action(ElementAction::Invoke, &target).is_err());
+        target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
+            name: "custom".into(),
+            description: String::new(),
+        }]));
+        assert!(semantic_action(ElementAction::Invoke, &target).is_err());
         target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![]));
         assert!(semantic_action(ElementAction::Invoke, &target).is_err());
         target.node.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
@@ -1902,6 +2232,222 @@ mod tests {
         assert!(snapshot.node_limit_reached);
         assert!(snapshot.depth_limit_reached);
         assert_eq!(snapshot.elements[1].node.window_frame.unwrap().x, 10);
+    }
+
+    #[tokio::test]
+    async fn visible_view_prunes_hidden_document_subtrees() {
+        let fake = FakeAdapter::tree();
+        {
+            let mut state = fake.state.lock().unwrap();
+            let mut hidden = node("background-document", "document web", "Background tab");
+            hidden.states.insert("visible".into());
+            hidden.children = vec![id("private-link")];
+            let link = node("private-link", "link", "Hidden account");
+            state.nodes.insert(hidden.object.clone(), hidden);
+            state.nodes.insert(link.object.clone(), link);
+            state
+                .nodes
+                .get_mut(&id("root"))
+                .unwrap()
+                .children
+                .push(id("background-document"));
+        }
+        let runtime = fake_runtime(fake);
+
+        let full = requested_snapshot(&runtime, ObservationView::Full, None).await;
+        assert!(
+            full.elements
+                .iter()
+                .any(|element| element.node.name == "Hidden account")
+        );
+
+        let visible = requested_snapshot(&runtime, ObservationView::Visible, None).await;
+        assert!(
+            visible
+                .elements
+                .iter()
+                .all(|element| element.node.name != "Background tab"
+                    && element.node.name != "Hidden account")
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_query_is_compact_and_preserves_element_ids() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let snapshot = requested_snapshot(
+            &runtime,
+            ObservationView::Interactive,
+            Some("button".into()),
+        )
+        .await;
+        let output = observation_output(&snapshot, false, Some("test"), None, None);
+        let elements = output.structured_content.unwrap()["elements"]
+            .as_array()
+            .unwrap()
+            .clone();
+
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["element_id"], "1");
+        assert_eq!(elements[0]["name"], "Button");
+        assert!(output.text.contains("1: button name=\"Button\""));
+        assert!(!output.text.contains("2: text"));
+        assert_eq!(cached_element(&snapshot, "1").unwrap().node.name, "Button");
+        let hidden = cached_element(&snapshot, "2").unwrap_err();
+        assert!(hidden.message.contains("included"), "{hidden}");
+
+        let mut changed = (*snapshot).clone();
+        changed.elements[1].node.role = "text".into();
+        changed.elements[1].node.name = "Renamed".into();
+        changed.elements[1].node.capabilities = inspected(ActionCapabilities::Unsupported);
+        let changed_error =
+            ensure_element_presented(&changed, &changed.elements[1], "1").unwrap_err();
+        assert!(changed_error.message.contains("no longer included"));
+    }
+
+    #[tokio::test]
+    async fn semantic_action_rejects_element_that_left_the_filtered_view() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        let snapshot = requested_snapshot(
+            &runtime,
+            ObservationView::Interactive,
+            Some("activate".into()),
+        )
+        .await;
+        let state_id = snapshot_state_id(&snapshot);
+        {
+            let mut state = fake.state.lock().unwrap();
+            let NodeCapabilities::Inspected(capabilities) =
+                &mut state.nodes.get_mut(&id("button")).unwrap().capabilities
+            else {
+                panic!("button capabilities should be inspected");
+            };
+            capabilities.actions = ActionCapabilities::Inspected(vec![ActionInfo {
+                name: "default".into(),
+                description: "Default".into(),
+            }]);
+        }
+
+        let error = runtime
+            .element_action(&state_id, "1", ElementAction::Invoke)
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("no longer included"), "{error}");
+        assert!(fake.state.lock().unwrap().actions.is_empty());
+        assert!(runtime.required_cached(&state_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn observing_another_window_keeps_the_prior_state_cached() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let first = requested_snapshot(&runtime, ObservationView::Full, None).await;
+        let first_id = snapshot_state_id(&first);
+        let mut reused_objects = (*first).clone();
+        reused_objects.app.pid = 11;
+        reused_objects.generation = 0;
+        let reused_objects = runtime.commit_snapshot(reused_objects).unwrap();
+        assert!(runtime.required_cached(&first_id).is_ok());
+        assert!(
+            runtime
+                .required_cached(&snapshot_state_id(&reused_objects))
+                .is_ok()
+        );
+
+        let mut other = (*first).clone();
+        other.app_query = "Browser".into();
+        other.app.name = "Browser".into();
+        other.app.pid = 20;
+        other.app.object = id("browser-app");
+        other.window.object = id("browser-window");
+        other.generation = 0;
+
+        let second = runtime.commit_snapshot(other).unwrap();
+
+        assert_eq!(
+            runtime.required_cached(&first_id).unwrap().app.name,
+            "Editor"
+        );
+        assert_eq!(
+            runtime
+                .required_cached(&snapshot_state_id(&second))
+                .unwrap()
+                .app
+                .name,
+            "Browser"
+        );
+
+        {
+            let mut cache = runtime.lock_cache().unwrap();
+            for cached in &mut cache.observations {
+                cached.screenshot_mapping = Some(test_screenshot_mapping(
+                    &cached.snapshot,
+                    "/session/cache",
+                    None,
+                ));
+            }
+        }
+        runtime
+            .lock_cache()
+            .unwrap()
+            .invalidate_for_mutation(&first)
+            .unwrap();
+        let cache = runtime.lock_cache().unwrap();
+        assert!(
+            cache
+                .observations
+                .iter()
+                .all(|cached| cached.screenshot_mapping.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn action_revalidation_keeps_the_observed_background_window() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        let snapshot = requested_snapshot(&runtime, ObservationView::Full, None).await;
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.app.windows[0].states.remove("active");
+            let mut other = window("Other", &["active", "showing"]);
+            other.object = id("other-root");
+            state.app.windows.push(other);
+            state
+                .nodes
+                .insert(id("other-root"), node("other-root", "frame", "Other"));
+        }
+
+        let fresh = runtime.fresh_for_action(&snapshot).await.unwrap();
+        assert_eq!(fresh.window.object, snapshot.window.object);
+        assert_eq!(fresh.window.title, "Main");
+    }
+
+    #[test]
+    fn cache_byte_budget_evicts_oldest_target() {
+        let payload = "x".repeat(MAX_CACHED_SNAPSHOT_STRING_BYTES / 2 + 1);
+        let mut cache = Cache::default();
+        let first = cache.insert(snapshot_for_target(1, &payload)).unwrap();
+        let second = cache.insert(snapshot_for_target(2, &payload)).unwrap();
+        assert!(cache.required(&snapshot_state_id(&first)).is_err());
+        assert_eq!(
+            cache
+                .required(&snapshot_state_id(&second))
+                .unwrap()
+                .snapshot
+                .app
+                .pid,
+            2
+        );
+    }
+
+    #[test]
+    fn cache_rejects_oversized_snapshot_without_replacing_prior_state() {
+        let mut cache = Cache::default();
+        let prior = cache.insert(snapshot_for_target(1, "small")).unwrap();
+        let payload = "x".repeat(MAX_CACHED_SNAPSHOT_STRING_BYTES + 1);
+        let error = cache.insert(snapshot_for_target(1, &payload)).unwrap_err();
+        assert!(error.message.contains("byte limit"), "{error}");
+        assert!(cache.required(&snapshot_state_id(&prior)).is_ok());
     }
 
     #[tokio::test]
@@ -2077,7 +2623,7 @@ mod tests {
         let error = runtime
             .execute_call(ToolCall::Keyboard {
                 state_id: "s-0000000000000001".into(),
-                focus: (1.0, 2.0),
+                focus: KeyboardFocus::Point((1.0, 2.0)),
                 action: KeyboardAction::Type("x".into()),
             })
             .await
@@ -2108,7 +2654,7 @@ mod tests {
             },
             ToolCall::Keyboard {
                 state_id: "s-0000000000000001".into(),
-                focus: (1.0, 2.0),
+                focus: KeyboardFocus::Point((1.0, 2.0)),
                 action: KeyboardAction::Press("A".into()),
             },
             ToolCall::Pointer {
@@ -2134,15 +2680,7 @@ mod tests {
         let runtime = fake_runtime(fake.clone());
         runtime.launch_in_progress.store(true, Ordering::Release);
 
-        let error = runtime
-            .execute_call(ToolCall::Observe {
-                target: "Editor".into(),
-                text_limit: None,
-                max_tree_nodes: None,
-                max_tree_depth: None,
-            })
-            .await
-            .unwrap_err();
+        let error = runtime.execute_call(observe_call()).await.unwrap_err();
         assert_eq!(error.code, "backend_failed");
         assert_eq!(error.outcome, ToolOutcome::NotStarted);
         assert_eq!(fake.state.lock().unwrap().discoveries, 0);
@@ -2175,25 +2713,9 @@ mod tests {
     #[tokio::test]
     async fn actions_reject_a_stale_state_id() {
         let runtime = fake_runtime(FakeAdapter::tree());
-        runtime
-            .execute_call(ToolCall::Observe {
-                target: "Editor".into(),
-                text_limit: None,
-                max_tree_nodes: None,
-                max_tree_depth: None,
-            })
-            .await
-            .unwrap();
+        runtime.execute_call(observe_call()).await.unwrap();
         let stale_state_id = current_state_id(&runtime);
-        runtime
-            .execute_call(ToolCall::Observe {
-                target: "Editor".into(),
-                text_limit: None,
-                max_tree_nodes: None,
-                max_tree_depth: None,
-            })
-            .await
-            .unwrap();
+        runtime.execute_call(observe_call()).await.unwrap();
 
         let error = runtime
             .execute_call(ToolCall::ActOnElement {
@@ -2235,7 +2757,7 @@ mod tests {
         }
         let error = click(&runtime).await.unwrap_err();
         assert_eq!(error.code, "target_unavailable");
-        assert!(error.message.contains("window identity changed"));
+        assert!(error.message.contains("cached window is no longer present"));
 
         let fake = FakeAdapter::tree();
         let runtime = fake_runtime(fake.clone());
@@ -2310,15 +2832,7 @@ mod tests {
             },
             test_config(),
         );
-        let output = runtime
-            .execute_call(ToolCall::Observe {
-                target: "Editor".into(),
-                text_limit: None,
-                max_tree_nodes: None,
-                max_tree_depth: None,
-            })
-            .await
-            .unwrap();
+        let output = runtime.execute_call(observe_call()).await.unwrap();
         assert_eq!(output.png_base64.as_deref(), Some("cG5n"));
         assert!(!output.text.contains("Screenshot unavailable"));
         let state_id = current_state_id(&runtime);
@@ -2355,6 +2869,150 @@ mod tests {
             .unwrap_err();
         assert_eq!(retry.code, "state_required");
         assert_eq!(runtime.screenshots.generated.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_keyboard_focus_is_confirmed_before_no_click_input() {
+        use crate::{
+            input::GeneratedInputAction,
+            screenshot::{PrepareCapture, ScreenshotObservation},
+        };
+
+        #[derive(Default)]
+        struct RecordingScreenshots {
+            actions: Mutex<Vec<GeneratedInputAction>>,
+        }
+
+        impl ScreenshotProvider for RecordingScreenshots {
+            async fn prepare(&self) -> Result<PrepareCapture, ScreenshotError> {
+                Ok(PrepareCapture {
+                    consent_interrupted_observation: false,
+                })
+            }
+
+            async fn capture<'a>(
+                &'a self,
+                snapshot: &'a Snapshot,
+            ) -> Result<ScreenshotObservation, ScreenshotError> {
+                Ok(ScreenshotObservation {
+                    png_base64: "cG5n".into(),
+                    mapping: test_screenshot_mapping(snapshot, "/session/keyboard", None),
+                })
+            }
+
+            async fn perform_input<'a>(
+                &'a self,
+                _snapshot: &'a Snapshot,
+                _mapping: &'a ScreenshotMapping,
+                action: GeneratedInputAction,
+            ) -> Result<(), String> {
+                self.actions.lock().unwrap().push(action);
+                Ok(())
+            }
+        }
+
+        let fake = FakeAdapter::tree();
+        if let NodeCapabilities::Inspected(capabilities) = &mut fake
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&id("button"))
+            .unwrap()
+            .capabilities
+        {
+            capabilities.component = true;
+        }
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            fake.clone(),
+            RecordingScreenshots::default(),
+            test_config(),
+        );
+        runtime.execute_call(observe_call()).await.unwrap();
+
+        let output = runtime
+            .execute_call(ToolCall::Keyboard {
+                state_id: current_state_id(&runtime),
+                focus: KeyboardFocus::Element("1".into()),
+                action: KeyboardAction::Press("Enter".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.state.lock().unwrap().actions,
+            [(id("button"), SemanticAction::GrabFocus)]
+        );
+        assert_eq!(
+            *runtime.screenshots.actions.lock().unwrap(),
+            [GeneratedInputAction::Keyboard {
+                focus: KeyboardFocus::Element("1".into()),
+                action: KeyboardAction::Press("Enter".into()),
+            }]
+        );
+        assert_eq!(
+            output.structured_content.unwrap()["screenshot"]["ready"],
+            true
+        );
+
+        let failed_focus = FakeAdapter::tree();
+        {
+            let mut state = failed_focus.state.lock().unwrap();
+            state.semantic_focus_succeeds = false;
+            let NodeCapabilities::Inspected(capabilities) =
+                &mut state.nodes.get_mut(&id("button")).unwrap().capabilities
+            else {
+                panic!("button capabilities should be inspected");
+            };
+            capabilities.component = true;
+        }
+        let failed_runtime = SemanticRuntime::with_screenshot_provider(
+            failed_focus.clone(),
+            RecordingScreenshots::default(),
+            test_config(),
+        );
+        failed_runtime.execute_call(observe_call()).await.unwrap();
+        let error = failed_runtime
+            .execute_call(ToolCall::Keyboard {
+                state_id: current_state_id(&failed_runtime),
+                focus: KeyboardFocus::Element("1".into()),
+                action: KeyboardAction::Press("Enter".into()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.outcome, ToolOutcome::Unknown);
+        assert!(
+            error.message.contains("not focused after GrabFocus"),
+            "{error}"
+        );
+        assert!(
+            failed_runtime
+                .screenshots
+                .actions
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            failed_focus.state.lock().unwrap().actions,
+            [(id("button"), SemanticAction::GrabFocus)]
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_clears_all_screenshot_mappings() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let snapshot = requested_snapshot(&runtime, ObservationView::Full, None).await;
+        runtime.lock_cache().unwrap().observations[0].screenshot_mapping =
+            Some(test_screenshot_mapping(&snapshot, "/session/cleanup", None));
+
+        DesktopRuntime::cleanup(&runtime).await.unwrap();
+
+        assert!(
+            runtime.lock_cache().unwrap().observations[0]
+                .screenshot_mapping
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2421,15 +3079,7 @@ mod tests {
             },
             test_config(),
         ));
-        runtime
-            .execute_call(ToolCall::Observe {
-                target: "Editor".into(),
-                text_limit: None,
-                max_tree_nodes: None,
-                max_tree_depth: None,
-            })
-            .await
-            .unwrap();
+        runtime.execute_call(observe_call()).await.unwrap();
         let initial_state_id = current_state_id(&runtime);
         let mutation_runtime = Arc::clone(&runtime);
         let mutation_state_id = initial_state_id.clone();
@@ -2477,15 +3127,7 @@ mod tests {
             },
             test_config(),
         );
-        let output = runtime
-            .execute_call(ToolCall::Observe {
-                target: "Editor".into(),
-                text_limit: None,
-                max_tree_nodes: None,
-                max_tree_depth: None,
-            })
-            .await
-            .unwrap();
+        let output = runtime.execute_call(observe_call()).await.unwrap();
         assert!(output.png_base64.is_none());
         assert!(
             output.text.contains("Screenshot unavailable:"),
@@ -2544,16 +3186,7 @@ mod tests {
                 crop,
                 transform: crate::geometry::Transform::Normal,
             },
-            monitor: crate::geometry::MonitorMapping {
-                transformed_crop: crop,
-                scale_x: 1.0,
-                scale_y: 1.0,
-            },
-            output: crate::encoder::PngMapping {
-                size: (800, 600),
-                png_to_transformed_x: 1.0,
-                png_to_transformed_y: 1.0,
-            },
+            output_size: (800, 600),
         }
     }
 
@@ -2566,8 +3199,8 @@ mod tests {
             &runtime
                 .lock_cache()
                 .unwrap()
-                .current
-                .as_ref()
+                .observations
+                .last()
                 .unwrap()
                 .snapshot,
         )
@@ -2593,6 +3226,7 @@ mod tests {
         discoveries: usize,
         block_reads: bool,
         fail_actions: bool,
+        semantic_focus_succeeds: bool,
     }
 
     struct MutatingScreenshots {
@@ -2699,6 +3333,7 @@ mod tests {
                     discoveries: 0,
                     block_reads: false,
                     fail_actions: false,
+                    semantic_focus_succeeds: true,
                 })),
             }
         }
@@ -2738,12 +3373,72 @@ mod tests {
             if state.fail_actions {
                 return Err(operational_error("fake semantic action failure"));
             }
+            if state.semantic_focus_succeeds
+                && matches!(state.actions.last(), Some((_, SemanticAction::GrabFocus)))
+            {
+                for node in state.nodes.values_mut() {
+                    node.states.remove("focused");
+                }
+                state
+                    .nodes
+                    .get_mut(object)
+                    .ok_or_else(|| operational_error("stale fake focus object"))?
+                    .states
+                    .insert("focused".into());
+                state.app.windows[0].states.insert("active".into());
+            }
             Ok(())
         }
     }
 
     fn fake_runtime(fake: FakeAdapter) -> SemanticRuntime<FakeAdapter> {
         SemanticRuntime::with_config(fake, test_config())
+    }
+
+    async fn requested_snapshot(
+        runtime: &SemanticRuntime<FakeAdapter>,
+        view: ObservationView,
+        query: Option<String>,
+    ) -> Arc<Snapshot> {
+        runtime
+            .requested_snapshot("Editor".into(), view, query, None, None, None)
+            .await
+            .unwrap()
+    }
+
+    fn observe_call() -> ToolCall {
+        ToolCall::Observe {
+            target: "Editor".into(),
+            view: ObservationView::Full,
+            query: None,
+            text_limit: None,
+            max_tree_nodes: None,
+            max_tree_depth: None,
+        }
+    }
+
+    fn snapshot_for_target(pid: u32, text: &str) -> Snapshot {
+        let mut content = node(&format!("content-{pid}"), "text", "Content");
+        content.text = Some(text.into());
+        Snapshot {
+            app_query: format!("App {pid}"),
+            view: ObservationView::Full,
+            element_query: None,
+            app: app(&format!("App {pid}"), pid, "Main"),
+            window: window("Main", &["active", "showing"]),
+            generation: 0,
+            elements: vec![ElementSnapshot {
+                depth: 0,
+                node: content,
+            }],
+            node_limit_reached: false,
+            depth_limit_reached: false,
+            limits: SnapshotLimits {
+                text: text.len(),
+                nodes: 1,
+                depth: 1,
+            },
+        }
     }
 
     fn test_config() -> RuntimeConfig {

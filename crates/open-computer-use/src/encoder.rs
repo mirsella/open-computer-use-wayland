@@ -13,14 +13,7 @@ const MAX_DOWNSCALE_ATTEMPTS: usize = 10;
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodedPng {
     pub bytes: Vec<u8>,
-    pub mapping: PngMapping,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PngMapping {
     pub size: (u32, u32),
-    pub png_to_transformed_x: f64,
-    pub png_to_transformed_y: f64,
 }
 
 pub fn encode(
@@ -63,11 +56,7 @@ pub(crate) fn encode_with_limits(
         if bytes.len() <= maximum_bytes {
             return Ok(EncodedPng {
                 bytes,
-                mapping: PngMapping {
-                    size: (image.width(), image.height()),
-                    png_to_transformed_x: f64::from(output_crop.width) / f64::from(image.width()),
-                    png_to_transformed_y: f64::from(output_crop.height) / f64::from(image.height()),
-                },
+                size: (image.width(), image.height()),
             });
         }
         if image.width() == 1 && image.height() == 1 {
@@ -161,7 +150,7 @@ mod tests {
             9_000,
         )
         .unwrap();
-        assert!(encoded.mapping.size.0.max(encoded.mapping.size.1) <= 128);
+        assert!(encoded.size.0.max(encoded.size.1) <= 128);
         assert!(encoded.bytes.len() <= 9_000);
         assert_eq!(&encoded.bytes[..8], b"\x89PNG\r\n\x1a\n");
     }

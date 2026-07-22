@@ -8,33 +8,40 @@ use super::{
     keyboard::{KeyChord, parse_chord, unicode_keysym},
     pointer::button_code,
 };
-use crate::validation::MouseButton;
+use crate::validation::{KeyboardAction, MouseButton};
 
 const FOCUS_SETTLE_DELAY: Duration = Duration::from_millis(50);
 
-pub async fn press_key(
-    backend: Arc<ReisInputBackend>,
-    focus: (f64, f64),
-    chord: &str,
-) -> Result<(), String> {
-    let chord = parse_chord(chord)?;
-    resolve_chord(&backend, &chord)?;
-    let resolver = Arc::clone(&backend);
-    focused_tap_sequence(backend, focus, move || resolve_chord(&resolver, &chord)).await
+pub fn preflight(backend: &ReisInputBackend, action: &KeyboardAction) -> Result<(), String> {
+    resolve_action(backend, action).map(drop)
 }
 
-pub async fn type_text(
+pub async fn perform(
     backend: Arc<ReisInputBackend>,
-    focus: (f64, f64),
-    text: &str,
+    focus: Option<(f64, f64)>,
+    action: KeyboardAction,
 ) -> Result<(), String> {
-    let keysyms = text
-        .chars()
-        .map(unicode_keysym)
-        .collect::<Result<Vec<_>, _>>()?;
-    resolve_text(&backend, &keysyms)?;
+    if focus.is_some() {
+        resolve_action(&backend, &action)?;
+    }
     let resolver = Arc::clone(&backend);
-    focused_tap_sequence(backend, focus, move || resolve_text(&resolver, &keysyms)).await
+    tap_sequence(backend, focus, move || resolve_action(&resolver, &action)).await
+}
+
+fn resolve_action(
+    backend: &ReisInputBackend,
+    action: &KeyboardAction,
+) -> Result<Vec<(Vec<KeyboardKey>, KeyboardKey)>, String> {
+    match action {
+        KeyboardAction::Press(chord) => resolve_chord(backend, &parse_chord(chord)?),
+        KeyboardAction::Type(text) => {
+            let keysyms = text
+                .chars()
+                .map(unicode_keysym)
+                .collect::<Result<Vec<_>, _>>()?;
+            resolve_text(backend, &keysyms)
+        }
+    }
 }
 
 fn resolve_chord(
@@ -98,9 +105,9 @@ fn keyboard_key(resolved: &ResolvedKey, keycode: u32) -> KeyboardKey {
     }
 }
 
-async fn focused_tap_sequence<B, F>(
+async fn tap_sequence<B, F>(
     backend: Arc<B>,
-    focus: (f64, f64),
+    focus: Option<(f64, f64)>,
     resolve: F,
 ) -> Result<(), String>
 where
@@ -111,16 +118,13 @@ where
     let mut guard = HeldInputGuard::new(Arc::clone(&backend));
     guard.begin().await?;
     let result = async {
-        backend
-            .emit(InputEvent::Absolute {
-                x: focus.0,
-                y: focus.1,
-            })
-            .await?;
-        let button = HeldInput::Button(button_code(MouseButton::Left));
-        guard.press(button).await?;
-        guard.release(button).await?;
-        sleep(FOCUS_SETTLE_DELAY).await;
+        if let Some((x, y)) = focus {
+            backend.emit(InputEvent::Absolute { x, y }).await?;
+            let button = HeldInput::Button(button_code(MouseButton::Left));
+            guard.press(button).await?;
+            guard.release(button).await?;
+            sleep(FOCUS_SETTLE_DELAY).await;
+        }
         let keys = resolve()?;
         for (modifiers, keycode) in keys {
             for &modifier in &modifiers {
@@ -162,7 +166,7 @@ mod tests {
         let resolved_after_focus = Arc::new(AtomicBool::new(false));
         let observed_backend = Arc::clone(&backend);
         let observed_resolution = Arc::clone(&resolved_after_focus);
-        focused_tap_sequence(Arc::clone(&backend), (125.5, 80.25), move || {
+        tap_sequence(Arc::clone(&backend), Some((125.5, 80.25)), move || {
             observed_resolution.store(
                 observed_backend.events.lock().unwrap().as_slice()
                     == [
@@ -207,6 +211,33 @@ mod tests {
                 },
                 InputEvent::Keycode {
                     key: modifier,
+                    pressed: false,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn keyboard_sequence_can_type_without_pointer_focus() {
+        let backend = FakeBackend::new();
+        let key = KeyboardKey {
+            device_id: 7,
+            resume_generation: 2,
+            keycode: 30,
+        };
+
+        tap_sequence(Arc::clone(&backend), None, move || {
+            Ok(vec![(Vec::new(), key)])
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            vec![
+                InputEvent::Keycode { key, pressed: true },
+                InputEvent::Keycode {
+                    key,
                     pressed: false,
                 },
             ]

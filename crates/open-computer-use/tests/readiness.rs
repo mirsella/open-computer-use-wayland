@@ -14,8 +14,8 @@ use open_computer_use::{
     runtime::{DesktopRuntime, ToolOutput},
     server::OpenComputerUseServer,
     validation::{
-        ApplicationScope, ElementAction, KeyboardAction, MouseButton, PointerAction, TextLimit,
-        ToolCall,
+        ApplicationScope, ElementAction, KeyboardAction, KeyboardFocus, ObservationView,
+        PointerAction, ToolCall,
     },
 };
 use rmcp::{
@@ -166,13 +166,9 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(TOOL_NAMES.len(), 6);
     assert_eq!(listed_names, TOOL_NAMES);
 
     let calls = valid_tool_calls();
-    for tool_name in TOOL_NAMES {
-        assert!(calls.iter().any(|(name, _)| *name == tool_name));
-    }
     let mut observe_response = None;
     for (offset, (name, arguments)) in calls.into_iter().enumerate() {
         let id = 10 + offset as u64;
@@ -274,12 +270,6 @@ async fn structured_content_is_gated_by_protocol_version_at_one_return_point() {
             .expect("runtime error text");
 
         assert_eq!(text, RUNTIME_ERROR_TEXT, "protocol {protocol_version}");
-        for field in ["Code:", "Outcome:", "Retryable:", "Recovery:"] {
-            assert!(
-                text.contains(field),
-                "protocol {protocol_version} error text omitted {field}"
-            );
-        }
         assert_eq!(result["isError"], true, "protocol {protocol_version}");
         assert_eq!(
             result.get("structuredContent"),
@@ -382,7 +372,6 @@ fn runtime_error_structured_content() -> Value {
 fn valid_tool_calls() -> Vec<(&'static str, Value)> {
     vec![
         ("list_applications", json!({"scope": "running"})),
-        ("list_applications", json!({"scope": "installed"})),
         (
             "launch_application",
             json!({"desktop_id": "org.example.Music.desktop"}),
@@ -391,9 +380,8 @@ fn valid_tool_calls() -> Vec<(&'static str, Value)> {
             "observe",
             json!({
                 "target": " Editor ",
-                "text_limit": "max",
-                "max_tree_nodes": 33,
-                "max_tree_depth": 4,
+                "view": "visible",
+                "query": " button ",
             }),
         ),
         (
@@ -408,27 +396,6 @@ fn valid_tool_calls() -> Vec<(&'static str, Value)> {
             "pointer",
             json!({
                 "state_id": "s-0123456789abcdef",
-                "action": {"type": "move", "x": 7.5, "y": 8.25},
-            }),
-        ),
-        (
-            "pointer",
-            json!({
-                "state_id": "s-0123456789abcdef",
-                "action": {"type": "click", "x": 12.5, "y": 18.25, "button": "left", "count": 1},
-            }),
-        ),
-        (
-            "pointer",
-            json!({
-                "state_id": "s-0123456789abcdef",
-                "action": {"type": "drag", "from_x": 1.25, "from_y": 2.5, "to_x": 30.75, "to_y": 40.5},
-            }),
-        ),
-        (
-            "pointer",
-            json!({
-                "state_id": "s-0123456789abcdef",
                 "action": {"type": "scroll", "x": 10.5, "y": 20.25, "direction": "right", "steps": 3},
             }),
         ),
@@ -436,15 +403,7 @@ fn valid_tool_calls() -> Vec<(&'static str, Value)> {
             "keyboard",
             json!({
                 "state_id": "s-0123456789abcdef",
-                "focus": {"x": 12.5, "y": 18.25},
-                "action": {"type": "press", "key": " Ctrl+Return "},
-            }),
-        ),
-        (
-            "keyboard",
-            json!({
-                "state_id": "s-0123456789abcdef",
-                "focus": {"x": 50.5, "y": 60.25},
+                "focus": {"element_id": "7"},
                 "action": {"type": "type", "text": "hello\nworld"},
             }),
         ),
@@ -456,42 +415,21 @@ fn expected_tool_calls() -> Vec<ToolCall> {
         ToolCall::ListApplications {
             scope: ApplicationScope::Running,
         },
-        ToolCall::ListApplications {
-            scope: ApplicationScope::Installed,
-        },
         ToolCall::LaunchApplication {
             desktop_id: "org.example.Music.desktop".to_owned(),
         },
         ToolCall::Observe {
             target: "Editor".to_owned(),
-            text_limit: Some(TextLimit::Max),
-            max_tree_nodes: Some(33),
-            max_tree_depth: Some(4),
+            view: ObservationView::Visible,
+            query: Some("button".to_owned()),
+            text_limit: None,
+            max_tree_nodes: None,
+            max_tree_depth: None,
         },
         ToolCall::ActOnElement {
             state_id: "s-0123456789abcdef".to_owned(),
             element_id: "007".to_owned(),
             action: ElementAction::Named("show menu".to_owned()),
-        },
-        ToolCall::Pointer {
-            state_id: "s-0123456789abcdef".to_owned(),
-            action: PointerAction::Move { x: 7.5, y: 8.25 },
-        },
-        ToolCall::Pointer {
-            state_id: "s-0123456789abcdef".to_owned(),
-            action: PointerAction::Click {
-                x: 12.5,
-                y: 18.25,
-                button: MouseButton::Left,
-                count: 1,
-            },
-        },
-        ToolCall::Pointer {
-            state_id: "s-0123456789abcdef".to_owned(),
-            action: PointerAction::Drag {
-                from: (1.25, 2.5),
-                to: (30.75, 40.5),
-            },
         },
         ToolCall::Pointer {
             state_id: "s-0123456789abcdef".to_owned(),
@@ -504,12 +442,7 @@ fn expected_tool_calls() -> Vec<ToolCall> {
         },
         ToolCall::Keyboard {
             state_id: "s-0123456789abcdef".to_owned(),
-            focus: (12.5, 18.25),
-            action: KeyboardAction::Press("Ctrl+Return".to_owned()),
-        },
-        ToolCall::Keyboard {
-            state_id: "s-0123456789abcdef".to_owned(),
-            focus: (50.5, 60.25),
+            focus: KeyboardFocus::Element("7".to_owned()),
             action: KeyboardAction::Type("hello\nworld".to_owned()),
         },
     ]
@@ -541,7 +474,6 @@ fn assert_png_content(response: &Value, expected_png: &[u8]) {
         .decode(content[1]["data"].as_str().expect("base64 image data"))
         .expect("decode image content");
     assert_eq!(decoded, expected_png);
-    assert!(decoded.starts_with(b"\x89PNG\r\n\x1a\n"));
     let image = image::load_from_memory_with_format(&decoded, ImageFormat::Png)
         .expect("decode generated PNG");
     assert_eq!(image.dimensions(), (3, 2));

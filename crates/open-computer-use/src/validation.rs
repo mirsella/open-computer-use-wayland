@@ -10,6 +10,7 @@ pub const MAX_TEXT_LIMIT: usize = 100_000;
 pub const MAX_TREE_NODES: usize = 5_000;
 pub const MAX_TREE_DEPTH: usize = 128;
 pub const MAX_ELEMENT_ID: usize = MAX_TREE_NODES - 1;
+pub const MAX_QUERY_LENGTH: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationScope {
@@ -21,6 +22,30 @@ pub enum ApplicationScope {
 pub enum TextLimit {
     Count(usize),
     Max,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ObservationView {
+    #[default]
+    Full,
+    Visible,
+    Interactive,
+}
+
+impl ObservationView {
+    pub const ALL: [Self; 3] = [Self::Full, Self::Visible, Self::Interactive];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Visible => "visible",
+            Self::Interactive => "interactive",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|view| view.as_str() == value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +94,12 @@ pub enum KeyboardAction {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum KeyboardFocus {
+    Point((f64, f64)),
+    Element(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ToolCall {
     ListApplications {
         scope: ApplicationScope,
@@ -78,6 +109,8 @@ pub enum ToolCall {
     },
     Observe {
         target: String,
+        view: ObservationView,
+        query: Option<String>,
         text_limit: Option<TextLimit>,
         max_tree_nodes: Option<usize>,
         max_tree_depth: Option<usize>,
@@ -93,7 +126,7 @@ pub enum ToolCall {
     },
     Keyboard {
         state_id: String,
-        focus: (f64, f64),
+        focus: KeyboardFocus,
         action: KeyboardAction,
     },
 }
@@ -116,6 +149,8 @@ pub fn validate_call(
         },
         "observe" => ToolCall::Observe {
             target: required_nonblank(&mut arguments, "target")?,
+            view: optional_observation_view(&mut arguments, "view")?,
+            query: optional_query(&mut arguments, "query")?,
             text_limit: optional_text_limit(&mut arguments, "text_limit")?,
             max_tree_nodes: optional_bounded(&mut arguments, "max_tree_nodes", MAX_TREE_NODES)?,
             max_tree_depth: optional_bounded(&mut arguments, "max_tree_depth", MAX_TREE_DEPTH)?,
@@ -131,7 +166,7 @@ pub fn validate_call(
         },
         "keyboard" => ToolCall::Keyboard {
             state_id: required_state_id(&mut arguments, "state_id")?,
-            focus: point(required_object(&mut arguments, "focus")?)?,
+            focus: keyboard_focus(required_object(&mut arguments, "focus")?)?,
             action: keyboard_action(required_object(&mut arguments, "action")?)?,
         },
         _ => return invalid(format!("unknown tool {name:?}")),
@@ -223,10 +258,14 @@ fn keyboard_action(
     Ok(action)
 }
 
-fn point(mut object: JsonObject<String, Value>) -> Result<(f64, f64), ValidationError> {
-    let point = coordinate_pair(&mut object, "x", "y")?;
+fn keyboard_focus(mut object: JsonObject<String, Value>) -> Result<KeyboardFocus, ValidationError> {
+    let focus = if object.contains_key("element_id") {
+        KeyboardFocus::Element(required_element_id(&mut object, "element_id")?)
+    } else {
+        KeyboardFocus::Point(coordinate_pair(&mut object, "x", "y")?)
+    };
     reject_unknown(object)?;
-    Ok(point)
+    Ok(focus)
 }
 
 fn required(
@@ -275,7 +314,10 @@ fn required_desktop_id(
     key: &str,
 ) -> Result<String, ValidationError> {
     let value = required_string(arguments, key)?;
-    if !value.ends_with(".desktop") || value.chars().any(char::is_whitespace) {
+    if value.len() == ".desktop".len()
+        || !value.ends_with(".desktop")
+        || value.chars().any(char::is_whitespace)
+    {
         return invalid(format!(
             "argument {key:?} must be an exact non-whitespace desktop ID ending in .desktop"
         ));
@@ -386,6 +428,45 @@ fn optional_button(
         Some("middle") => Ok(Some(MouseButton::Middle)),
         _ => invalid(format!("argument {key:?} must be left, right, or middle")),
     }
+}
+
+fn optional_observation_view(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<ObservationView, ValidationError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(ObservationView::default());
+    };
+    value
+        .as_str()
+        .and_then(ObservationView::parse)
+        .ok_or_else(|| {
+            ValidationError(format!(
+                "argument {key:?} must be full, visible, or interactive"
+            ))
+        })
+}
+
+fn optional_query(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<Option<String>, ValidationError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(None);
+    };
+    let query = value
+        .as_str()
+        .ok_or_else(|| ValidationError(format!("argument {key:?} must be a string")))?;
+    if query.chars().count() > MAX_QUERY_LENGTH {
+        return invalid(format!(
+            "argument {key:?} must contain at most {MAX_QUERY_LENGTH} characters"
+        ));
+    }
+    let query = query.trim();
+    if query.is_empty() {
+        return invalid(format!("argument {key:?} must not be blank"));
+    }
+    Ok(Some(query.to_owned()))
 }
 
 fn optional_bounded<T>(

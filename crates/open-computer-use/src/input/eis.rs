@@ -28,13 +28,6 @@ use super::{
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EisCapabilities {
-    pub button: bool,
-    pub scroll: bool,
-    pub keyboard: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedKey {
     pub device_id: u64,
     pub resume_generation: u64,
@@ -57,6 +50,7 @@ struct EisState {
     connection: Option<reis::event::Connection>,
     devices: HashMap<u64, DeviceState>,
     terminal: Option<String>,
+    binding: Option<EisBinding>,
 }
 
 impl EisState {
@@ -65,39 +59,34 @@ impl EisState {
             connection: None,
             devices: HashMap::new(),
             terminal: None,
+            binding: None,
         }
     }
 
-    fn pointer_device(&self, route: &EisRegion) -> Result<Option<u64>, String> {
-        let mut matches = Vec::new();
+    fn pointer_device(&self, mapping_id: &str) -> Result<Option<EisBinding>, String> {
+        let mut matched = None;
         for (&id, state) in &self.devices {
             if !state.resumed || state.device.interface::<ei::PointerAbsolute>().is_none() {
                 continue;
             }
             for region in state.device.regions() {
-                let position = (
-                    i32::try_from(region.x).map_err(|_| "EIS region x exceeds i32 range")?,
-                    i32::try_from(region.y).map_err(|_| "EIS region y exceeds i32 range")?,
-                );
-                let size = (
-                    i32::try_from(region.width)
-                        .map_err(|_| "EIS region width exceeds i32 range")?,
-                    i32::try_from(region.height)
-                        .map_err(|_| "EIS region height exceeds i32 range")?,
-                );
-                if region_matches_route(route, region.mapping_id.as_deref(), position, size) {
-                    matches.push(id);
+                if region.mapping_id.as_deref() == Some(mapping_id) {
+                    let candidate = EisBinding {
+                        pointer_id: id,
+                        resume_generation: state.resume_generation,
+                        region: EisRegion {
+                            position: (region.x, region.y),
+                            size: (region.width, region.height),
+                            mapping_id: region.mapping_id.clone(),
+                        },
+                    };
+                    if matched.replace(candidate).is_some() {
+                        return Err("multiple resumed EIS regions match the selected monitor stream; refusing ambiguous input".into());
+                    }
                 }
             }
         }
-        match matches.as_slice() {
-            [id] => Ok(Some(*id)),
-            [] => Ok(None),
-            many => Err(format!(
-                "{} resumed EIS regions exactly match the selected monitor stream; refusing ambiguous input",
-                many.len()
-            )),
-        }
+        Ok(matched)
     }
 
     fn scroll_device(&self, pointer_device: u64) -> Result<Option<u64>, String> {
@@ -175,6 +164,13 @@ struct CleanupState {
     sequence_pending: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct EisBinding {
+    pointer_id: u64,
+    resume_generation: u64,
+    region: EisRegion,
+}
+
 struct EisThread {
     shutdown: Option<UnixStream>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -209,7 +205,7 @@ impl Drop for EisAttemptGuard {
 
 pub struct ReisInputBackend {
     session: Arc<PortalSessionLease>,
-    route: EisRegion,
+    mapping_id: String,
     state: Arc<Mutex<EisState>>,
     ready: Arc<Notify>,
     cleanup: Mutex<CleanupState>,
@@ -221,7 +217,7 @@ pub struct ReisInputBackend {
 impl ReisInputBackend {
     pub async fn connect(
         session: Arc<PortalSessionLease>,
-        route: EisRegion,
+        mapping_id: String,
     ) -> Result<Arc<Self>, String> {
         let attempt = EisAttemptGuard::new(Arc::clone(&session))?;
         let socket = session.connect_to_eis().await?;
@@ -253,7 +249,7 @@ impl ReisInputBackend {
             .map_err(|error| format!("cannot start EIS event thread: {error}"))?;
         let backend = Arc::new(Self {
             session,
-            route,
+            mapping_id,
             state,
             ready,
             cleanup: Mutex::new(CleanupState::default()),
@@ -276,18 +272,29 @@ impl ReisInputBackend {
     async fn wait_ready(&self, keyboard_required: bool) -> Result<EisRegion, String> {
         loop {
             {
-                let state = self
+                let mut state = self
                     .state
                     .lock()
                     .map_err(|_| "EIS state mutex poisoned".to_owned())?;
                 if let Some(error) = &state.terminal {
                     return Err(error.clone());
                 }
-                if let Some(pointer) = state.pointer_device(&self.route)? {
+                if let Some(binding) = state.pointer_device(&self.mapping_id)? {
                     let keyboard_ready =
-                        !keyboard_required || state.keyboard_device(pointer)?.is_some();
+                        !keyboard_required || state.keyboard_device(binding.pointer_id)?.is_some();
                     if keyboard_ready {
-                        return Ok(self.route.clone());
+                        if state
+                            .binding
+                            .as_ref()
+                            .is_some_and(|selected| selected != &binding)
+                        {
+                            return Err(
+                                "selected EIS region changed during the portal session".into()
+                            );
+                        }
+                        let region = binding.region.clone();
+                        state.binding = Some(binding);
+                        return Ok(region);
                     }
                 }
             }
@@ -316,31 +323,47 @@ impl ReisInputBackend {
         if let Some(error) = &state.terminal {
             return Err(error.clone());
         }
-        state.pointer_device(&self.route)?.ok_or_else(|| {
-            "no resumed EIS region exactly matches the selected monitor stream".to_owned()
-        })?;
-        Ok(self.route.clone())
+        Ok(self.pointer_device_for_action(&state)?.region)
     }
 
-    pub fn capabilities(&self) -> Result<EisCapabilities, String> {
+    fn pointer_device_for_action(&self, state: &EisState) -> Result<EisBinding, String> {
+        let current = state
+            .pointer_device(&self.mapping_id)?
+            .ok_or_else(|| "exact EIS pointer region is no longer resumed".to_owned())?;
+        let bound = state
+            .binding
+            .as_ref()
+            .ok_or("EIS monitor region was not bound during input preparation")?;
+        if bound != &current {
+            return Err("selected EIS region changed before input dispatch".into());
+        }
+        Ok(current)
+    }
+
+    pub fn require_capabilities(
+        &self,
+        button: bool,
+        scroll: bool,
+        keyboard: bool,
+    ) -> Result<(), String> {
         let state = self
             .state
             .lock()
             .map_err(|_| "EIS state mutex poisoned".to_owned())?;
-        let id = state
-            .pointer_device(&self.route)?
-            .ok_or("exact EIS pointer region is no longer resumed")?;
-        let button = state
+        let pointer = self.pointer_device_for_action(&state)?.pointer_id;
+        let pointer_state = state
             .devices
-            .get(&id)
-            .is_some_and(|device| device.device.interface::<ei::Button>().is_some());
-        let scroll = state.scroll_device(id)?.is_some();
-        let keyboard = state.keyboard_device(id)?.is_some();
-        Ok(EisCapabilities {
-            button,
-            scroll,
-            keyboard,
-        })
+            .get(&pointer)
+            .ok_or("selected EIS pointer disappeared")?;
+        if button && pointer_state.device.interface::<ei::Button>().is_none()
+            || scroll && state.scroll_device(pointer)?.is_none()
+            || keyboard && state.keyboard_device(pointer)?.is_none()
+        {
+            return Err(
+                "EIS backend lacks the device capabilities required for this action".into(),
+            );
+        }
+        Ok(())
     }
 
     pub fn resolve_keysyms(&self, keysyms: &[u32]) -> Result<Vec<ResolvedKey>, String> {
@@ -348,9 +371,7 @@ impl ReisInputBackend {
             .state
             .lock()
             .map_err(|_| "EIS state mutex poisoned".to_owned())?;
-        let pointer_id = state
-            .pointer_device(&self.route)?
-            .ok_or("exact EIS pointer region is no longer resumed")?;
+        let pointer_id = self.pointer_device_for_action(&state)?.pointer_id;
         let id = state
             .keyboard_device(pointer_id)?
             .ok_or_else(|| "no resumed and synchronized EIS keyboard is available".to_owned())?;
@@ -439,21 +460,17 @@ impl ReisInputBackend {
 
     fn selected_device(&self, state: &EisState, event: &InputEvent) -> Result<u64, String> {
         match event {
-            InputEvent::Absolute { .. } | InputEvent::Button { .. } => state
-                .pointer_device(&self.route)?
-                .ok_or_else(|| "exact EIS pointer region is no longer resumed".into()),
+            InputEvent::Absolute { .. } | InputEvent::Button { .. } => self
+                .pointer_device_for_action(state)
+                .map(|binding| binding.pointer_id),
             InputEvent::ScrollDiscrete { .. } => {
-                let pointer = state
-                    .pointer_device(&self.route)?
-                    .ok_or("exact EIS pointer region is no longer resumed")?;
+                let pointer = self.pointer_device_for_action(state)?.pointer_id;
                 state
                     .scroll_device(pointer)?
                     .ok_or_else(|| "EIS scroll device is no longer resumed".into())
             }
             InputEvent::Keycode { key, .. } => {
-                let pointer = state
-                    .pointer_device(&self.route)?
-                    .ok_or("exact EIS pointer region is no longer resumed")?;
+                let pointer = self.pointer_device_for_action(state)?.pointer_id;
                 let current = state
                     .keyboard_device(pointer)?
                     .ok_or("synchronized EIS keyboard is no longer resumed")?;
@@ -482,9 +499,7 @@ impl ReisInputBackend {
             .connection
             .clone()
             .ok_or("EIS connection is not ready")?;
-        let pointer_id = state
-            .pointer_device(&self.route)?
-            .ok_or("exact EIS pointer region is no longer resumed")?;
+        let pointer_id = self.pointer_device_for_action(&state)?.pointer_id;
         let device = state
             .devices
             .get_mut(&pointer_id)
@@ -1207,20 +1222,6 @@ fn validate_event(event: &InputEvent) -> Result<(), String> {
     Ok(())
 }
 
-fn region_matches_route(
-    route: &EisRegion,
-    mapping_id: Option<&str>,
-    position: (i32, i32),
-    size: (i32, i32),
-) -> bool {
-    route.position == position
-        && route.size == size
-        && route
-            .mapping_id
-            .as_deref()
-            .is_none_or(|expected| mapping_id == Some(expected))
-}
-
 fn validate_key_binding(
     current_device_id: u64,
     current_resume_generation: u64,
@@ -1274,33 +1275,6 @@ mod tests {
         let second = monotonic_microseconds();
         assert!(first > 0);
         assert!(second >= first);
-    }
-
-    #[test]
-    fn route_matching_requires_exact_geometry_and_recorded_mapping_id() {
-        let route = EisRegion {
-            position: (-1920, 0),
-            size: (1920, 1080),
-            mapping_id: Some("monitor-1".into()),
-        };
-        assert!(region_matches_route(
-            &route,
-            Some("monitor-1"),
-            (-1920, 0),
-            (1920, 1080)
-        ));
-        assert!(!region_matches_route(
-            &route,
-            Some("monitor-2"),
-            (-1920, 0),
-            (1920, 1080)
-        ));
-        assert!(!region_matches_route(
-            &route,
-            Some("monitor-1"),
-            (0, 0),
-            (1920, 1080)
-        ));
     }
 
     #[test]

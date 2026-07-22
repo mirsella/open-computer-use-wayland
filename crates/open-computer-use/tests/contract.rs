@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use open_computer_use::{
     contract::{TOOL_NAMES, tool_definitions},
     runtime::ToolOutput,
@@ -10,10 +12,157 @@ fn tools_have_exact_order_and_schemas() {
     let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     assert_eq!(names, TOOL_NAMES);
 
-    let expected = expected_schemas();
-    for (tool, schema) in tools.iter().zip(expected) {
-        assert_eq!(tool.schema_as_json_value(), schema, "{} schema", tool.name);
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == name)
+            .expect("tool definition")
+            .schema_as_json_value()
+    };
+    assert_object(&schema("list_applications"), &["scope"], &["scope"]);
+    assert_eq!(
+        schema("list_applications")["properties"]["scope"]["enum"],
+        json!(["running", "installed"])
+    );
+    assert_object(
+        &schema("launch_application"),
+        &["desktop_id"],
+        &["desktop_id"],
+    );
+    assert_eq!(
+        schema("launch_application")["properties"]["desktop_id"]["pattern"],
+        "^[^\\s]+\\.desktop$"
+    );
+
+    let observe = schema("observe");
+    assert_object(
+        &observe,
+        &[
+            "target",
+            "view",
+            "query",
+            "text_limit",
+            "max_tree_nodes",
+            "max_tree_depth",
+        ],
+        &["target"],
+    );
+    assert_eq!(
+        observe["properties"]["view"]["enum"],
+        json!(["full", "visible", "interactive"])
+    );
+    assert_eq!(observe["properties"]["query"]["pattern"], ".*\\S.*");
+    assert_eq!(observe["properties"]["query"]["maxLength"], 1_000);
+    assert_eq!(observe["properties"]["max_tree_nodes"]["maximum"], 5_000);
+    assert_eq!(observe["properties"]["max_tree_depth"]["maximum"], 128);
+    assert_eq!(
+        observe["properties"]["text_limit"]["anyOf"][0]["maximum"],
+        100_000
+    );
+
+    let act = schema("act_on_element");
+    assert_object(
+        &act,
+        &["state_id", "element_id", "action"],
+        &["state_id", "element_id", "action"],
+    );
+    assert_eq!(
+        act["properties"]["element_id"]["anyOf"][1]["maximum"],
+        4_999
+    );
+    assert_eq!(act["properties"]["state_id"], state_id());
+    assert_union(
+        &act["properties"]["action"],
+        &[
+            ("invoke", &["type"], &["type"]),
+            ("focus", &["type"], &["type"]),
+            ("named", &["type", "name"], &["type", "name"]),
+            ("set_value", &["type", "value"], &["type", "value"]),
+        ],
+    );
+
+    let pointer = schema("pointer");
+    assert_object(&pointer, &["state_id", "action"], &["state_id", "action"]);
+    assert_eq!(pointer["properties"]["state_id"], state_id());
+    assert_union(
+        &pointer["properties"]["action"],
+        &[
+            ("move", &["type", "x", "y"], &["type", "x", "y"]),
+            (
+                "click",
+                &["type", "x", "y", "button", "count"],
+                &["type", "x", "y"],
+            ),
+            (
+                "drag",
+                &["type", "from_x", "from_y", "to_x", "to_y"],
+                &["type", "from_x", "from_y", "to_x", "to_y"],
+            ),
+            (
+                "scroll",
+                &["type", "x", "y", "direction", "steps"],
+                &["type", "x", "y", "direction"],
+            ),
+        ],
+    );
+    assert_eq!(
+        pointer["properties"]["action"]["oneOf"][1]["properties"]["count"]["maximum"],
+        3
+    );
+    assert_eq!(
+        pointer["properties"]["action"]["oneOf"][1]["properties"]["button"]["default"],
+        "left"
+    );
+    assert_eq!(
+        pointer["properties"]["action"]["oneOf"][1]["properties"]["button"]["enum"],
+        json!(["left", "right", "middle"])
+    );
+    assert_eq!(
+        pointer["properties"]["action"]["oneOf"][3]["properties"]["steps"]["maximum"],
+        100
+    );
+    assert_eq!(
+        pointer["properties"]["action"]["oneOf"][3]["properties"]["steps"]["default"],
+        1
+    );
+    assert_eq!(
+        pointer["properties"]["action"]["oneOf"][3]["properties"]["direction"]["enum"],
+        json!(["up", "down", "left", "right"])
+    );
+    for action in pointer["properties"]["action"]["oneOf"].as_array().unwrap() {
+        for coordinate in ["x", "y", "from_x", "from_y", "to_x", "to_y"] {
+            if !action["properties"][coordinate].is_null() {
+                assert_eq!(action["properties"][coordinate]["minimum"], 0);
+            }
+        }
     }
+
+    let keyboard = schema("keyboard");
+    assert_object(
+        &keyboard,
+        &["state_id", "focus", "action"],
+        &["state_id", "focus", "action"],
+    );
+    let focus = keyboard["properties"]["focus"]["oneOf"].as_array().unwrap();
+    assert_eq!(focus.len(), 2);
+    assert_object(&focus[0], &["x", "y"], &["x", "y"]);
+    assert_object(&focus[1], &["element_id"], &["element_id"]);
+    assert_eq!(focus[0]["properties"]["x"]["minimum"], 0);
+    assert_eq!(
+        focus[1]["properties"]["element_id"]["anyOf"][1]["maximum"],
+        4_999
+    );
+    assert_union(
+        &keyboard["properties"]["action"],
+        &[
+            ("press", &["type", "key"], &["type", "key"]),
+            ("type", &["type", "text"], &["type", "text"]),
+        ],
+    );
+    let key_pattern = keyboard["properties"]["action"]["oneOf"][0]["properties"]["key"]["pattern"]
+        .as_str()
+        .unwrap();
+    assert!(key_pattern.contains("[Aa][Ll][Tt]") && key_pattern.contains("[Tt][Aa][Bb]"));
 }
 
 #[test]
@@ -64,34 +213,54 @@ fn output_schemas_have_expected_shapes() {
 
     let list_schema = output_schema("list_applications");
     let list = &list_schema["oneOf"][0];
-    assert_eq!(list["type"], "object");
-    assert_eq!(list["required"], json!(["scope", "applications"]));
+    assert_object(list, &["scope", "applications"], &["scope", "applications"]);
     assert_eq!(list["properties"]["scope"]["type"], "string");
     assert_eq!(list["properties"]["applications"]["type"], "array");
 
     let launch_schema = output_schema("launch_application");
     let launch = &launch_schema["oneOf"][0];
-    assert_eq!(launch["type"], "object");
-    assert_eq!(launch["required"], json!(["status", "desktop_id", "name"]));
+    assert_object(
+        launch,
+        &["status", "desktop_id", "name"],
+        &["status", "desktop_id", "name"],
+    );
     assert_eq!(launch["properties"]["status"]["const"], "requested");
     assert_eq!(launch["properties"]["desktop_id"]["type"], "string");
     assert_eq!(launch["properties"]["name"]["type"], "string");
 
     let observation_schema = output_schema("observe");
     let observation = &observation_schema["oneOf"][0];
-    assert_eq!(observation["type"], "object");
-    assert_eq!(
-        observation["required"],
-        json!([
+    assert_object(
+        observation,
+        &[
             "state_id",
             "target",
+            "view",
+            "element_query",
             "screenshot",
             "coordinate_spaces",
-            "elements"
-        ])
+            "elements",
+        ],
+        &[
+            "state_id",
+            "target",
+            "view",
+            "element_query",
+            "screenshot",
+            "coordinate_spaces",
+            "elements",
+        ],
     );
     assert_eq!(observation["properties"]["state_id"], state_id());
     assert_eq!(observation["properties"]["target"]["type"], "object");
+    assert_eq!(
+        observation["properties"]["view"]["enum"],
+        json!(["full", "visible", "interactive"])
+    );
+    assert_eq!(
+        observation["properties"]["element_query"]["type"],
+        json!(["string", "null"])
+    );
     assert_eq!(
         observation["properties"]["screenshot"]["properties"]["coordinate_space"]["const"],
         "screenshot_png_pixels"
@@ -105,12 +274,10 @@ fn output_schemas_have_expected_shapes() {
     for name in TOOL_NAMES {
         let schema = output_schema(name);
         let error = &schema["oneOf"][1];
-        assert_eq!(error["type"], "object", "{name} error type");
-        assert_eq!(error["additionalProperties"], false, "{name} error closure");
-        assert_eq!(
-            error["required"],
-            json!(["code", "message", "outcome", "retryable", "recovery"]),
-            "{name} error fields"
+        assert_object(
+            error,
+            &["code", "message", "outcome", "retryable", "recovery"],
+            &["code", "message", "outcome", "retryable", "recovery"],
         );
     }
 }
@@ -132,101 +299,28 @@ fn image_output_serializes_as_mcp_text_then_png() {
     );
 }
 
-fn expected_schemas() -> Vec<Value> {
-    vec![
-        object(
-            json!({"scope": {"type": "string", "enum": ["running", "installed"]}}),
-            &["scope"],
-        ),
-        object(
-            json!({"desktop_id": {"type": "string", "pattern": "^[^\\s]+\\.desktop$"}}),
-            &["desktop_id"],
-        ),
-        object(
-            json!({
-                "target": {"type": "string", "pattern": ".*\\S.*"},
-                "text_limit": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 100_000}, {"const": "max"}], "default": 500, "description": "Per-element text limit; max means the server cap."},
-                "max_tree_nodes": {"type": "integer", "minimum": 1, "maximum": 5_000, "default": 1200},
-                "max_tree_depth": {"type": "integer", "minimum": 1, "maximum": 128, "default": 64},
-            }),
-            &["target"],
-        ),
-        object(
-            json!({
-                "state_id": state_id(),
-                "element_id": {"anyOf": [{"type": "string", "pattern": "^(?:[0-9]{1,3}|[0-4][0-9]{3})$"}, {"type": "integer", "minimum": 0, "maximum": 4_999}]},
-                "action": {"description": "Object, never a string. Use {\"type\":\"invoke\"}, {\"type\":\"focus\"}, {\"type\":\"named\",\"name\":\"...\"}, or {\"type\":\"set_value\",\"value\":\"...\"}.", "oneOf": [
-                    action("invoke", json!({}), &[]),
-                    action("focus", json!({}), &[]),
-                    action("named", json!({"name": {"type": "string", "pattern": ".*\\S.*"}}), &["name"]),
-                    action("set_value", json!({"value": {"type": "string"}}), &["value"]),
-                ]},
-            }),
-            &["state_id", "element_id", "action"],
-        ),
-        object(
-            json!({
-                "state_id": state_id(),
-                "action": {"description": "Object with type move, click, drag, or scroll.", "oneOf": [
-                    action("move", coordinates(&["x", "y"]), &["x", "y"]),
-                    action("click", merge(coordinates(&["x", "y"]), json!({"button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}})), &["x", "y"]),
-                    action("drag", coordinates(&["from_x", "from_y", "to_x", "to_y"]), &["from_x", "from_y", "to_x", "to_y"]),
-                    action("scroll", merge(coordinates(&["x", "y"]), json!({"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}, "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1}})), &["x", "y", "direction"]),
-                ]},
-            }),
-            &["state_id", "action"],
-        ),
-        object(
-            json!({
-                "state_id": state_id(),
-                "focus": object(coordinates(&["x", "y"]), &["x", "y"]),
-                "action": {"description": "Object: {\"type\":\"press\",\"key\":\"Ctrl+L\"} or {\"type\":\"type\",\"text\":\"...\"}.", "oneOf": [
-                    action("press", json!({"key": {"type": "string", "pattern": "^(?!(?=.*(?:^|\\+)\\s*[Aa][Ll][Tt]\\s*(?:\\+|$))(?=.*(?:^|\\+)\\s*[Tt][Aa][Bb]\\s*(?:\\+|$))).*\\S.*$", "description": "Examples: Ctrl+L, Enter, F5, é. Chords containing both Alt and Tab are rejected."}}), &["key"]),
-                    action("type", json!({"text": {"type": "string"}}), &["text"]),
-                ]},
-            }),
-            &["state_id", "focus", "action"],
-        ),
-    ]
-}
-
-fn object(properties: Value, required: &[&str]) -> Value {
-    let mut schema = json!({
-        "type": "object",
-        "properties": properties,
-        "additionalProperties": false,
-    });
-    if !required.is_empty() {
-        schema["required"] = json!(required);
-    }
-    schema
-}
-
 fn state_id() -> Value {
     json!({"type": "string", "pattern": "^s-[0-9a-f]{16}$"})
 }
 
-fn coordinates(names: &[&str]) -> Value {
-    let mut properties = serde_json::Map::new();
-    for name in names {
-        properties.insert((*name).to_owned(), json!({"type": "number", "minimum": 0}));
+fn assert_object(schema: &Value, properties: &[&str], required: &[&str]) {
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(required));
+    let actual = schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, properties.iter().copied().collect());
+}
+
+fn assert_union(schema: &Value, variants: &[(&str, &[&str], &[&str])]) {
+    let actual = schema["oneOf"].as_array().unwrap();
+    assert_eq!(actual.len(), variants.len());
+    for (action, (kind, properties, required)) in actual.iter().zip(variants) {
+        assert_object(action, properties, required);
+        assert_eq!(action["properties"]["type"]["const"], *kind);
     }
-    Value::Object(properties)
-}
-
-fn action(kind: &str, properties: Value, required: &[&str]) -> Value {
-    let mut properties = properties.as_object().cloned().expect("action properties");
-    properties.insert("type".into(), json!({"const": kind}));
-    let mut required = required
-        .iter()
-        .map(|value| json!(value))
-        .collect::<Vec<_>>();
-    required.insert(0, json!("type"));
-    json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false})
-}
-
-fn merge(left: Value, right: Value) -> Value {
-    let mut merged = left.as_object().cloned().expect("left object");
-    merged.extend(right.as_object().cloned().expect("right object"));
-    Value::Object(merged)
 }

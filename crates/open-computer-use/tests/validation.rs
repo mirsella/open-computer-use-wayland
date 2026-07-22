@@ -1,7 +1,7 @@
 use open_computer_use::validation::{
-    ApplicationScope, ElementAction, KeyboardAction, MAX_CLICK_COUNT, MAX_SCROLL_STEPS,
-    MAX_TEXT_LIMIT, MAX_TREE_DEPTH, MAX_TREE_NODES, MouseButton, PointerAction, TextLimit,
-    ToolCall, validate_call,
+    ApplicationScope, ElementAction, KeyboardAction, KeyboardFocus, MAX_CLICK_COUNT,
+    MAX_QUERY_LENGTH, MAX_SCROLL_STEPS, MAX_TEXT_LIMIT, MAX_TREE_DEPTH, MAX_TREE_NODES,
+    MouseButton, ObservationView, PointerAction, TextLimit, ToolCall, validate_call,
 };
 use serde_json::{Map, Value, json};
 
@@ -31,6 +31,8 @@ fn accepts_all_six_tools() {
         ),
         ToolCall::Observe {
             target: "Editor".into(),
+            view: ObservationView::Full,
+            query: None,
             text_limit: Some(TextLimit::Max),
             max_tree_nodes: Some(12),
             max_tree_depth: Some(3),
@@ -64,7 +66,7 @@ fn accepts_all_six_tools() {
         ),
         ToolCall::Keyboard {
             state_id: STATE_ID.into(),
-            focus: (3.0, 4.0),
+            focus: KeyboardFocus::Point((3.0, 4.0)),
             action: KeyboardAction::Press("Enter".into()),
         }
     );
@@ -107,12 +109,53 @@ fn parses_nested_discriminated_actions_and_defaults() {
     assert!(matches!(
         valid("observe", json!({"target": "Editor"})),
         ToolCall::Observe {
+            view: ObservationView::Full,
+            query: None,
             text_limit: None,
             max_tree_nodes: None,
             max_tree_depth: None,
             ..
         }
     ));
+}
+
+#[test]
+fn parses_observation_views_queries_and_semantic_keyboard_focus() {
+    for (view, expected) in [
+        ("full", ObservationView::Full),
+        ("visible", ObservationView::Visible),
+        ("interactive", ObservationView::Interactive),
+    ] {
+        assert!(matches!(
+            valid("observe", json!({"target": "Editor", "view": view})),
+            ToolCall::Observe {
+                view: actual,
+                query: None,
+                ..
+            } if actual == expected
+        ));
+    }
+    assert!(matches!(
+        valid(
+            "observe",
+            json!({"target": "Editor", "query": " button "})
+        ),
+        ToolCall::Observe {
+            query: Some(query),
+            ..
+        } if query == "button"
+    ));
+    assert_eq!(
+        valid(
+            "keyboard",
+            json!({"state_id": STATE_ID, "focus": {"element_id": "007"}, "action": {"type": "type", "text": "hello"}})
+        ),
+        ToolCall::Keyboard {
+            state_id: STATE_ID.into(),
+            focus: KeyboardFocus::Element("007".into()),
+            action: KeyboardAction::Type("hello".into()),
+        }
+    );
 }
 
 #[test]
@@ -124,6 +167,8 @@ fn validates_numbers_and_bounded_counts() {
         ),
         ToolCall::Observe {
             target: "Editor".into(),
+            view: ObservationView::Full,
+            query: None,
             text_limit: Some(TextLimit::Count(12)),
             max_tree_nodes: Some(12),
             max_tree_depth: Some(3),
@@ -180,6 +225,8 @@ fn validates_numbers_and_bounded_counts() {
         valid("observe", json!({"target": "Editor", "text_limit": 0})),
         ToolCall::Observe {
             target: "Editor".into(),
+            view: ObservationView::Full,
+            query: None,
             text_limit: Some(TextLimit::Count(0)),
             max_tree_nodes: None,
             max_tree_depth: None,
@@ -287,6 +334,7 @@ fn rejects_unknown_fields_in_nested_objects() {
         .contains("unknown argument")
     );
     assert!(invalid("keyboard", json!({"state_id": STATE_ID, "focus": {"x": 1, "y": 2, "extra": true}, "action": {"type": "press", "key": "x"}})).contains("unknown argument"));
+    assert!(invalid("keyboard", json!({"state_id": STATE_ID, "focus": {"element_id": 1, "extra": true}, "action": {"type": "press", "key": "x"}})).contains("unknown argument"));
     assert!(invalid(
         "act_on_element",
         json!({"state_id": STATE_ID, "element_id": 1, "action": {"type": "invoke", "extra": true}})
@@ -325,6 +373,7 @@ fn rejects_padded_or_incomplete_desktop_ids() {
         "org.example.Editor.desktop ",
         "org.example.Editor",
         "org.example Editor.desktop",
+        ".desktop",
         "",
     ] {
         assert!(
@@ -387,6 +436,11 @@ fn validates_identifiers_and_preserves_literal_text_and_values() {
             .contains("element ID")
         );
     }
+    assert!(invalid(
+        "keyboard",
+        json!({"state_id": STATE_ID, "focus": {"element_id": 5_000}, "action": {"type": "press", "key": "x"}}),
+    )
+    .contains("element ID"));
     for element_id in [
         Value::String("0".repeat(20)),
         Value::String("0".repeat(21)),
@@ -413,6 +467,34 @@ fn validates_identifiers_and_preserves_literal_text_and_values() {
     assert_eq!(
         keyboard_action(json!({"type": "type", "text": "   "})),
         KeyboardAction::Type("   ".into())
+    );
+}
+
+#[test]
+fn rejects_invalid_observation_views_and_queries() {
+    for view in [json!("all"), json!("VISIBLE"), json!(1), Value::Null] {
+        assert!(
+            invalid("observe", json!({"target": "Editor", "view": view}))
+                .contains("must be full, visible, or interactive")
+        );
+    }
+    for query in [json!(""), json!("  "), json!(1), Value::Null] {
+        let error = invalid("observe", json!({"target": "Editor", "query": query}));
+        assert!(error.contains("must not be blank") || error.contains("must be a string"));
+    }
+    assert!(
+        invalid(
+            "observe",
+            json!({"target": "Editor", "query": "x".repeat(MAX_QUERY_LENGTH + 1)})
+        )
+        .contains("at most 1000 characters")
+    );
+    assert!(
+        invalid(
+            "observe",
+            json!({"target": "Editor", "query": format!(" {} ", "x".repeat(MAX_QUERY_LENGTH))})
+        )
+        .contains("at most 1000 characters")
     );
 }
 

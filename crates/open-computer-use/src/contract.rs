@@ -4,8 +4,8 @@ use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Map as JsonObject, Value, json};
 
 use crate::validation::{
-    MAX_CLICK_COUNT, MAX_ELEMENT_ID, MAX_SCROLL_STEPS, MAX_TEXT_LIMIT, MAX_TREE_DEPTH,
-    MAX_TREE_NODES,
+    MAX_CLICK_COUNT, MAX_ELEMENT_ID, MAX_QUERY_LENGTH, MAX_SCROLL_STEPS, MAX_TEXT_LIMIT,
+    MAX_TREE_DEPTH, MAX_TREE_NODES, ObservationView,
 };
 
 pub const TOOL_NAMES: [&str; 6] = [
@@ -17,7 +17,7 @@ pub const TOOL_NAMES: [&str; 6] = [
     "keyboard",
 ];
 
-pub const SERVER_INSTRUCTIONS: &str = "Use `list_applications` to discover running targets or exact installed desktop IDs. Use `observe` before acting; it returns an opaque `state_id`, current AT-SPI state, and the full approved-monitor PNG. Every element, pointer, and keyboard action requires that exact `state_id`; stale state is rejected and successful actions return a new observation. Every `action` argument is an object with a required `type` field, never a string. Element actions use AT-SPI. Pointer and keyboard coordinates use `screenshot_png_pixels`, never AT-SPI frames. Keyboard actions first left-click `focus`; choose a visible point inside the target app. If the target is not visibly reachable, stop instead of using a desktop focus-switch shortcut.";
+pub const SERVER_INSTRUCTIONS: &str = "Use `list_applications` to discover running targets or exact installed desktop IDs. Use `observe` before acting; it returns an opaque target-scoped `state_id`, current AT-SPI state, and the approved-monitor PNG. `observe.view` selects full, visible, or interactive output, and `observe.query` narrows the observed tree. Every element, pointer, and keyboard action requires that exact `state_id`; missing or replaced target state is rejected and successful actions return a new observation. Every `action` argument is an object with a required `type` field, never a string. Element actions use AT-SPI. Pointer and point-focused keyboard coordinates use `screenshot_png_pixels`, never AT-SPI frames. Keyboard focus may be a visible screenshot point, which is left-clicked first, or an observed `element_id`, which receives semantic AT-SPI focus. If the target is not visibly reachable, stop instead of using a desktop focus-switch shortcut.";
 
 pub fn tool_definitions() -> Vec<Tool> {
     vec![
@@ -43,10 +43,12 @@ pub fn tool_definitions() -> Vec<Tool> {
         ),
         tool(
             "observe",
-            "Observe one running target by PID, app name, window title, or unique substring.",
+            "Observe one running target by PID, app name, window title, or unique substring. Optionally select a full, visible, or interactive view and narrow the tree with a nonblank query.",
             object(
                 json!({
                     "target": {"type": "string", "pattern": ".*\\S.*"},
+                    "view": {"type": "string", "enum": observation_view_names()},
+                    "query": {"type": "string", "pattern": ".*\\S.*", "maxLength": MAX_QUERY_LENGTH},
                     "text_limit": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": MAX_TEXT_LIMIT}, {"const": "max"}], "default": 500, "description": "Per-element text limit; max means the server cap."},
                     "max_tree_nodes": {"type": "integer", "minimum": 1, "maximum": MAX_TREE_NODES, "default": 1200},
                     "max_tree_depth": {"type": "integer", "minimum": 1, "maximum": MAX_TREE_DEPTH, "default": 64}
@@ -62,7 +64,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             object(
                 json!({
                     "state_id": state_id(),
-                    "element_id": {"anyOf": [{"type": "string", "pattern": "^(?:[0-9]{1,3}|[0-4][0-9]{3})$"}, {"type": "integer", "minimum": 0, "maximum": MAX_ELEMENT_ID}]},
+                    "element_id": element_id(),
                     "action": {"description": "Object, never a string. Use {\"type\":\"invoke\"}, {\"type\":\"focus\"}, {\"type\":\"named\",\"name\":\"...\"}, or {\"type\":\"set_value\",\"value\":\"...\"}.", "oneOf": [
                         action_object("invoke", json!({}), &[]),
                         action_object("focus", json!({}), &[]),
@@ -101,11 +103,14 @@ pub fn tool_definitions() -> Vec<Tool> {
         ),
         tool(
             "keyboard",
-            "Left-click focus in current screenshot pixels, then press a key/chord or type literal text.",
+            "Focus a visible screenshot point by left-clicking it, or semantically focus an observed element_id, then press a key/chord or type literal text.",
             object(
                 json!({
                     "state_id": state_id(),
-                    "focus": object(coordinates(&["x", "y"]), &["x", "y"]),
+                    "focus": {"description": "Either an exact screenshot point {\"x\": ..., \"y\": ...}, which is left-clicked first, or {\"element_id\": ...}, which receives semantic AT-SPI focus.", "oneOf": [
+                        object(coordinates(&["x", "y"]), &["x", "y"]),
+                        object(json!({"element_id": element_id()}), &["element_id"])
+                    ]},
                     "action": {"description": "Object: {\"type\":\"press\",\"key\":\"Ctrl+L\"} or {\"type\":\"type\",\"text\":\"...\"}.", "oneOf": [
                         action_object("press", json!({"key": {"type": "string", "pattern": "^(?!(?=.*(?:^|\\+)\\s*[Aa][Ll][Tt]\\s*(?:\\+|$))(?=.*(?:^|\\+)\\s*[Tt][Aa][Bb]\\s*(?:\\+|$))).*\\S.*$", "description": "Examples: Ctrl+L, Enter, F5, é. Chords containing both Alt and Tab are rejected."}}), &["key"]),
                         action_object("type", json!({"text": {"type": "string"}}), &["text"])
@@ -158,6 +163,8 @@ fn output_schema(name: &str) -> Value {
             json!({
                 "state_id": state_id(),
                 "target": {"type": "object"},
+                "view": {"type": "string", "enum": observation_view_names()},
+                "element_query": {"type": ["string", "null"]},
                 "screenshot": {"type": "object", "properties": {
                     "ready": {"type": "boolean"},
                     "reason": {"type": ["string", "null"]},
@@ -171,6 +178,8 @@ fn output_schema(name: &str) -> Value {
             &[
                 "state_id",
                 "target",
+                "view",
+                "element_query",
                 "screenshot",
                 "coordinate_spaces",
                 "elements",
@@ -196,6 +205,14 @@ fn error_output_schema() -> Value {
 
 fn state_id() -> Value {
     json!({"type": "string", "pattern": "^s-[0-9a-f]{16}$"})
+}
+
+fn element_id() -> Value {
+    json!({"anyOf": [{"type": "string", "pattern": "^(?:[0-9]{1,3}|[0-4][0-9]{3})$"}, {"type": "integer", "minimum": 0, "maximum": MAX_ELEMENT_ID}]})
+}
+
+fn observation_view_names() -> [&'static str; 3] {
+    ObservationView::ALL.map(ObservationView::as_str)
 }
 
 fn coordinates(names: &[&str]) -> Value {
