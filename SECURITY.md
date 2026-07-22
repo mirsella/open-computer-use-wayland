@@ -8,12 +8,14 @@ for a trusted local MCP host and user.
 
 Current safeguards:
 
-- `act_on_element`, `pointer`, and `keyboard` require the exact ID from the one current `observe` result in the same process; stale state is rejected;
+- `act_on_element`, `pointer`, and `keyboard` require an exact retained ID from
+  the same process. The cache is bounded and retains only the latest state for
+  each app/window target; replaced, consumed, and evicted states are rejected;
 - application launch accepts only a full, exact, case-sensitive `desktop_id` from
   installed `list_applications` and launches its exact GIO app record; callers cannot supply a
   command, path, or arguments;
 - app lookup never chooses an ambiguous match;
-- launch clears the current observation and returns an acknowledgement; callers must observe before acting;
+- launch clears the observation cache and returns an acknowledgement; callers must observe before acting;
 - cached PID, exact app/window identity, and generation-scoped elements are checked;
 - semantic actions require the same non-defunct accessible object, role, and name;
 - unsupported interfaces, timeouts, and identity failures stop the action;
@@ -30,8 +32,9 @@ Current safeguards:
 - routine screenshots remain in memory and are not written to disk;
 - MCP stdout contains protocol frames only;
 - generated input requires the exact cached app PID and app/window identities,
-  observation generation, live portal session and stream, in-bounds full-monitor
-  PNG point, and actual RemoteDesktop device grant;
+  observation generation, live portal session and stream, and actual
+  RemoteDesktop device grant. Pointer and point-focused keyboard actions also
+  require an in-bounds full-monitor PNG point;
 - coordinates are never clamped and no global scale is inferred;
 - pointer movement uses the same single-use screenshot mapping as clicks but
   emits no button event; hover effects and auto-hidden panels may still change;
@@ -46,34 +49,34 @@ Current safeguards:
   match the screenshot mapping before generated input starts. Its format
   generation must also match, and a newer frame is allowed only when that
   metadata remains unchanged.
+- any semantic or generated mutation clears every retained screenshot mapping,
+  including mappings for other cached targets, because the monitor pixels may
+  have changed;
 - generated keyboard input fails closed when physical Ctrl, Alt, Super, or a
   latched modifier is active immediately before keyboard emulation, and modifier
   state is synchronized after each keyboard action. Physical modifier changes can
   race a multi-key transaction because EIS cannot distinguish them from synthetic
-  held modifiers; do not type during generated input. `keyboard` requires a current screenshot
-  point and left-click it before emitting global EIS keyboard events. The app
-  name is not treated as a keyboard-routing primitive. Desktop focus-switch
-  shortcuts such as Alt+Tab are rejected.
-- element focus uses AT-SPI only on the freshly revalidated exact object. It does
-  not prove window activation; callers must inspect the returned monitor
-  screenshot before generated input.
+  held modifiers; do not type during generated input. Point focus clicks an
+  in-bounds PNG point. Element focus revalidates the exact AT-SPI object, calls
+  `Component.GrabFocus`, emits no pointer event, and requires a post-focus read
+  reporting that element focused and its window active. AT-SPI state can still
+  race compositor seat focus. App names and focus-switch shortcuts such as
+  Alt+Tab are not keyboard-routing primitives.
 
 There is no portal permission boundary around AT-SPI reads or semantic actions.
 The monitor screenshot may expose unrelated apps, notifications, desktop files,
 or other private content. Screenshots do not gate semantic actions or prove that
 a target is unoccluded.
+Visible and interactive observation views reduce accessibility-tree disclosure,
+but they do not crop or redact the complete-monitor screenshot.
 A semantic action may have completed before a post-action refresh reports an
 error; callers must treat that error as uncertain final state, not proof that
 the action did not occur.
 
-Capture and generated input require a user-approved portal session and bind each
-returned PNG to an exact frame and app/window generation. Observation metadata
-reports screenshot readiness, reason, dimensions, and `screenshot_png_pixels`;
-element frames remain separate `atspi_window_coordinates`. Invalid crop metadata,
-unknown transforms, DMA-BUF-only data, stale state, and ambiguous streams or EIS
-regions stop capture or input. EIS absolute motion and coordinate-targeted wheel
-scroll are bound to the one exact monitor region. Unsupported text and changed mappings fail
-closed.
+Capture and input bind each PNG to its approved stream, frame, target generation,
+and EIS region. Invalid, stale, missing, changed, or ambiguous mappings fail
+closed. Element frames remain `atspi_window_coordinates`; point input uses
+`screenshot_png_pixels` normalized into compositor-private EIS coordinates.
 
 The server cannot prove that an AT-SPI semantic action had no effect when its
 reply is lost or cancellation happens during the call. Generated input cleanup

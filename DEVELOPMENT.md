@@ -2,8 +2,8 @@
 
 ## Toolchain and dependencies
 
-The workspace pins Rust 1.89.0 and declares 1.89 as its MSRV. Update both values
-together. Workspace dependencies use exact versions. The AT-SPI stack uses
+The workspace tracks stable Rust and declares 1.97 as its MSRV. Workspace
+dependencies use exact versions. The AT-SPI stack uses
 `atspi`, `atspi-proxies`, and zbus with Tokio compatibility; keep features as
 small as upstream permits.
 
@@ -52,9 +52,9 @@ deterministic tests. Cover request cancellation and changed handles,
 chunks, pixel orientation, and post-frame AT-SPI revalidation. Do not make the
 normal test suite depend on a live desktop.
 
-Generated-input coverage includes ConnectToEIS lifecycle state, exact monitor
-region matching, key chord parsing, keymap resolution, pointer move/click and wheel sequences,
-full-monitor coordinate inversion, resume synchronization, and held-state
+Generated-input coverage includes ConnectToEIS lifecycle state, unambiguous
+monitor-region selection, private EIS coordinate normalization, key chord parsing,
+keymap resolution, pointer move/click and wheel sequences, resume synchronization, and held-state
 cleanup. These tests must stay
 local and must not contact a desktop portal.
 Keep regression coverage for complete-action emulation transactions, fresh
@@ -84,9 +84,13 @@ observe-then-act testing.
 The MCP API has exactly six tools: `list_applications` (`running` or `installed`),
 `launch_application`, `observe`, `act_on_element`, `pointer`, and `keyboard`.
 Keep their closed schemas and action unions in `contract.rs` aligned with
-`validation.rs`. `observe` owns the one current global state ID; element,
-pointer, and keyboard calls must reject stale IDs and successful UI actions must
-return replacement observations. Preserve structured observation metadata:
+`validation.rs`. `observe` accepts full, visible, and interactive views plus an
+optional semantic query. The runtime keeps a bounded cache containing at most
+the latest state for each exact app/window; observing one target must not stale
+unrelated targets. Element, pointer, and keyboard calls must reject missing or
+replaced IDs, consume the acted-on state, and return replacement observations
+after successful UI actions. Any mutation or cleanup must clear screenshot
+mappings for every cached target. Preserve structured observation metadata:
 element capabilities; screenshot readiness, reason, dimensions, and coordinate
 spaces; and structured runtime error `outcome`, `retryable`, and `recovery`.
 `launch_application` must remain restricted to an exact full case-sensitive
@@ -101,6 +105,9 @@ refer to the complete approved monitor. Never derive a global target from AT-SPI
 window or element extents. Tests must use fake backends and must not open a
 portal, send desktop input, or run ignored live tests. Add no portal `Notify*`,
 X11, clipboard, subprocess, or `/dev/uinput` fallback.
-Generated keyboard tools must keep their required focus click and key events in
-one cleanup-safe EIS transaction. An app string alone never proves or changes
-seat focus.
+Generated keyboard tools with screenshot-point focus must keep the focus click
+and key events in one cleanup-safe EIS transaction. Element-focused keyboard
+tools must freshly relocate the exact AT-SPI object, call
+`Component.GrabFocus`, confirm the element is focused and its window active,
+and then send keys without a pointer click. An app string
+alone never proves or changes seat focus.

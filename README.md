@@ -21,20 +21,21 @@ APIs, or guessed display geometry.
 | --- | --- |
 | `list_applications` | List running AT-SPI apps or installed desktop entries. |
 | `launch_application` | Launch an exact desktop ID returned by the installed listing. |
-| `observe` | Return accessibility state, screenshot metadata, and the approved-monitor PNG. |
+| `observe` | Return full, visible, or interactive accessibility state, optional query matches, screenshot metadata, and the approved-monitor PNG. |
 | `act_on_element` | Invoke, focus, run a named action, or set an element value through AT-SPI. |
 | `pointer` | Move, click, drag, or scroll in screenshot pixel coordinates. |
-| `keyboard` | Click a visible focus point, then press a key chord or type literal text. |
+| `keyboard` | Focus by screenshot point or observed element ID, then press a key chord or type literal text. |
 
-`observe` returns an opaque `state_id`. Element, pointer, and keyboard calls
-must use the current ID. A successful UI action returns a new observation and
-invalidates the old ID. `launch_application` clears the current state, so call
+`observe` returns an opaque `state_id`. The runtime retains a bounded set of
+latest observations for different app/window targets; observing the same target
+replaces its prior ID. A successful UI action returns a new observation and
+invalidates the acted-on ID. `launch_application` clears all states, so call
 `observe` after launch.
 
 ## Requirements
 
 - KDE Plasma Wayland with `xdg-desktop-portal-kde`
-- Rust 1.89 or newer
+- Rust 1.97 or newer
 - AT-SPI, PipeWire, SPA, GLib/GIO, D-Bus, and libxkbcommon development files
 - An XDG RemoteDesktop portal with EIS support
 
@@ -86,13 +87,24 @@ composited image is returned by observations, including unrelated apps,
 occluding windows, and desktop content. The longest encoded dimension is capped
 at 1280 pixels.
 
-Pointer and keyboard coordinates use `screenshot_png_pixels`. Accessibility
-element frames use a separate `atspi_window_coordinates` space and must not be
-used as screenshot coordinates.
+Pointer coordinates and point-focused keyboard calls use
+`screenshot_png_pixels`. A keyboard call may instead use an observed
+`element_id`; the server revalidates it, requests AT-SPI focus, and sends keys
+without a pointer click only after the element reports focused and its window
+reports active. Accessibility element frames use a separate
+`atspi_window_coordinates` space and must not be used as screenshot coordinates.
 
-Before each action, the server rechecks the app PID, app and window identity,
-state generation, portal session, stream metadata, and exact EIS monitor region.
-Stale or ambiguous targets fail instead of falling back to another input route.
+Use `observe.view` with `full`, `visible`, or `interactive`. `visible` prunes
+hidden document subtrees such as background browser tabs; `interactive` further
+restricts output to elements with interactive roles, states, supported actions,
+or set-value capability. Optional `observe.query` matches semantic roles, names,
+values, text, states, and action labels without renumbering element IDs. These
+length-bounded filters affect accessibility output only; screenshots still
+contain the complete approved monitor.
+
+Before each action, the server rechecks the cached target and approved input
+mapping. Stale, missing, or ambiguous targets fail closed; see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the mapping model.
 
 Runtime errors include `code`, `message`, `outcome`, `retryable`, and
 `recovery`. If screenshot capture fails, `observe` still returns the text state
