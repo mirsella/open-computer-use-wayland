@@ -48,10 +48,10 @@ sudo apt-get install build-essential clang libclang-dev libdbus-1-dev \
 
 ## Install
 
-Build and install the binary from this checkout:
+Build and install the binary from the repository:
 
 ```sh
-cargo install --locked --path crates/open-computer-use
+cargo install --locked --git https://github.com/mirsella/open-computer-use-wayland
 ```
 
 When OpenCode enables the MCP, the server immediately asks KDE to restore or
