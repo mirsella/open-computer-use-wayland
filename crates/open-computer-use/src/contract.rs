@@ -17,7 +17,7 @@ pub const TOOL_NAMES: [&str; 6] = [
     "keyboard",
 ];
 
-pub const SERVER_INSTRUCTIONS: &str = "Use `list_applications` to discover running targets or exact installed desktop IDs. Use `observe` before acting; it returns an opaque target-scoped `state_id`, current AT-SPI state, and the approved-monitor PNG. `observe.view` selects full, visible, or interactive output, and `observe.query` narrows the observed tree. Every element, pointer, and keyboard action requires that exact `state_id`; missing or replaced target state is rejected and successful actions return a new observation. Every `action` argument is an object with a required `type` field, never a string. Element actions use AT-SPI. Pointer and point-focused keyboard coordinates use `screenshot_png_pixels`, never AT-SPI frames. Keyboard focus may be a visible screenshot point, which is left-clicked first, or an observed `element_id`, which receives semantic AT-SPI focus. If the target is not visibly reachable, stop instead of using a desktop focus-switch shortcut.";
+pub const SERVER_INSTRUCTIONS: &str = "Discover targets with `list_applications`, then call `observe` before acting. Pass returned `state_id` and element IDs unchanged; successful actions return a replacement observation. Use only advertised element capabilities. Pointer and point-focused keyboard coordinates use the returned PNG, not AT-SPI frames, and are not confined to the target window. Both keyboard focus modes require `screenshot.ready` and live generated input; `act_on_element` may work without capture. Stop if the target is not visibly reachable. Portal approval is not authorization for a specific action; honor the host's user confirmation.";
 
 pub fn tool_definitions() -> Vec<Tool> {
     vec![
@@ -39,7 +39,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 &["desktop_id"],
             ),
             false,
-            true,
+            false,
         ),
         tool(
             "observe",
@@ -55,7 +55,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 }),
                 &["target"],
             ),
-            false,
+            true,
             false,
         ),
         tool(

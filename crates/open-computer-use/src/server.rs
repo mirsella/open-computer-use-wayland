@@ -20,7 +20,7 @@ use crate::{
     VERSION,
     accessibility::{RuntimeConfig, SemanticRuntime},
     atspi_adapter::AtspiAdapter,
-    contract::{SERVER_INSTRUCTIONS, tool_definitions},
+    contract::{SERVER_INSTRUCTIONS, TOOL_NAMES, tool_definitions},
     errors::{CliError, RuntimeError, ToolOutcome},
     runtime::{DesktopRuntime, tool_error_result},
     screenshot::ProductionScreenshotCoordinator,
@@ -55,16 +55,22 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
                 .build(),
         )
         .with_server_info(Implementation::new("open-computer-use", VERSION))
-        .with_protocol_version(ProtocolVersion::V_2025_06_18)
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_instructions(SERVER_INSTRUCTIONS)
     }
 
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tool_definitions()))
+        let mut tools = tool_definitions();
+        if !supports_structured_content(&context) {
+            for tool in &mut tools {
+                tool.output_schema = None;
+            }
+        }
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -78,10 +84,28 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if !TOOL_NAMES.contains(&request.name.as_ref()) {
+            return Err(McpError::invalid_params(
+                format!("unknown tool {:?}", request.name),
+                None,
+            ));
+        }
         let arguments = request.arguments.unwrap_or_default();
         let call = match validate_call(&request.name, arguments) {
             Ok(call) => call,
-            Err(error) => return Err(McpError::invalid_params(error.to_string(), None)),
+            Err(error) => {
+                let error = RuntimeError::new(
+                    "invalid_arguments",
+                    error.to_string(),
+                    ToolOutcome::NotStarted,
+                    true,
+                    "Correct the arguments using the tool input schema, then retry.",
+                );
+                return Ok(for_protocol(
+                    tool_error_result(&error),
+                    supports_structured_content(&context),
+                ));
+            }
         };
         let _execution = self.execution_barrier.lock().await;
         let result = if self.unavailable.load(Ordering::Acquire) {

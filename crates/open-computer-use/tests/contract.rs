@@ -170,12 +170,12 @@ fn annotations_match_the_inherited_contract() {
     let tools = tool_definitions();
     for tool in tools {
         let annotations = serde_json::to_value(tool.annotations).expect("serialize annotations");
-        let expected = if tool.name.as_ref() == "list_applications" {
+        let expected = if matches!(tool.name.as_ref(), "list_applications" | "observe") {
             json!({
                 "openWorldHint": true,
                 "readOnlyHint": true,
             })
-        } else if tool.name.as_ref() == "observe" {
+        } else if tool.name.as_ref() == "launch_application" {
             json!({
                 "destructiveHint": false,
                 "idempotentHint": false,

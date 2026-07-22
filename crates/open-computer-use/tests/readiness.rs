@@ -26,6 +26,7 @@ use rmcp::{
 use serde_json::{Value, json};
 
 const RUNTIME_ERROR_TEXT: &str = "fake runtime unavailable\nCode: fake_runtime_unavailable\nOutcome: not_started\nRetryable: true\nRecovery: Call observe for current state, then retry only if the requested action is still needed.";
+const INVALID_ARGUMENTS_TEXT: &str = "missing required argument \"type\"\nCode: invalid_arguments\nOutcome: not_started\nRetryable: true\nRecovery: Correct the arguments using the tool input schema, then retry.";
 
 #[derive(Clone)]
 struct FakeRuntime {
@@ -197,28 +198,44 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
         &png,
     );
 
-    for (id, name, arguments) in [
-        (30, "not_a_tool", json!({})),
-        (
-            31,
-            "pointer",
-            json!({"state_id": "s-0123456789abcdef", "action": {}}),
-        ),
-    ] {
-        client
-            .send(message(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
-            })))
-            .await
-            .expect("send invalid tool call");
-        let response = response_value(client.receive().await.expect("protocol error response"));
-        assert_eq!(response["id"], id);
-        assert_eq!(response["error"]["code"], -32602);
-        assert!(response.get("result").is_none());
-    }
+    client
+        .send(message(json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": {"name": "not_a_tool", "arguments": {}},
+        })))
+        .await
+        .expect("send unknown tool call");
+    let unknown = response_value(client.receive().await.expect("unknown tool response"));
+    assert_eq!(unknown["id"], 30);
+    assert_eq!(unknown["error"]["code"], -32602);
+    assert!(unknown.get("result").is_none());
+
+    client
+        .send(message(json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "pointer",
+                "arguments": {"state_id": "s-0123456789abcdef", "action": {}},
+            },
+        })))
+        .await
+        .expect("send invalid arguments");
+    let invalid = response_value(client.receive().await.expect("invalid arguments response"));
+    assert_eq!(invalid["id"], 31);
+    assert!(invalid.get("error").is_none());
+    assert_eq!(invalid["result"]["isError"], true);
+    assert_eq!(
+        invalid["result"]["content"][0]["text"],
+        INVALID_ARGUMENTS_TEXT
+    );
+    assert_eq!(
+        invalid["result"]["structuredContent"],
+        invalid_arguments_structured_content()
+    );
     assert_eq!(runtime.calls(), expected_tool_calls());
 
     runtime.fail_next();
@@ -253,37 +270,44 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
 
 #[tokio::test]
 async fn structured_content_is_gated_by_protocol_version_at_one_return_point() {
-    for (protocol_version, expects_structured_content) in [
-        ("2024-11-05", false),
-        ("2025-03-26", false),
-        ("2025-11-25", true),
+    for (requested, negotiated, expects_structured_content) in [
+        ("2024-11-05", "2024-11-05", false),
+        ("2025-03-26", "2025-03-26", false),
+        ("2025-06-18", "2025-06-18", true),
+        ("2025-11-25", "2025-11-25", true),
+        ("2026-07-28", "2026-07-28", true),
+        ("2099-01-01", "2025-11-25", true),
     ] {
-        let (success, response) = results_for_protocol(protocol_version).await;
+        let (listed, success, response) = results_for_protocol(requested, negotiated).await;
+        for tool in listed["result"]["tools"].as_array().expect("listed tools") {
+            assert_eq!(
+                tool.get("outputSchema").is_some(),
+                expects_structured_content,
+                "output schema for protocol {negotiated}"
+            );
+        }
         assert_eq!(
             success["result"].get("structuredContent"),
             expects_structured_content.then_some(&json!({"status": "fake"})),
-            "successful result for protocol {protocol_version}"
+            "successful result for protocol {negotiated}"
         );
         let result = &response["result"];
         let text = result["content"][0]["text"]
             .as_str()
             .expect("runtime error text");
 
-        assert_eq!(text, RUNTIME_ERROR_TEXT, "protocol {protocol_version}");
-        assert_eq!(result["isError"], true, "protocol {protocol_version}");
+        assert_eq!(text, RUNTIME_ERROR_TEXT, "protocol {negotiated}");
+        assert_eq!(result["isError"], true, "protocol {negotiated}");
         assert_eq!(
             result.get("structuredContent"),
             expects_structured_content.then_some(&runtime_error_structured_content()),
-            "protocol {protocol_version}"
+            "protocol {negotiated}"
         );
-        assert!(
-            response.get("error").is_none(),
-            "protocol {protocol_version}"
-        );
+        assert!(response.get("error").is_none(), "protocol {negotiated}");
     }
 }
 
-async fn results_for_protocol(protocol_version: &str) -> (Value, Value) {
+async fn results_for_protocol(requested: &str, negotiated: &str) -> (Value, Value, Value) {
     let runtime = FakeRuntime::new(STANDARD.encode(test_png()));
     let server_runtime = runtime.clone();
     let (server_transport, client_transport) = tokio::io::duplex(8 * 1024);
@@ -305,7 +329,7 @@ async fn results_for_protocol(protocol_version: &str) -> (Value, Value) {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": protocol_version,
+                "protocolVersion": requested,
                 "capabilities": {},
                 "clientInfo": {"name": "readiness-protocol-test", "version": "0.0.0"},
             },
@@ -314,7 +338,7 @@ async fn results_for_protocol(protocol_version: &str) -> (Value, Value) {
         .expect("send initialize");
     let initialized = response_value(client.receive().await.expect("initialize response"));
     assert_eq!(
-        initialized["result"]["protocolVersion"], protocol_version,
+        initialized["result"]["protocolVersion"], negotiated,
         "protocol negotiation"
     );
     client
@@ -324,6 +348,16 @@ async fn results_for_protocol(protocol_version: &str) -> (Value, Value) {
         })))
         .await
         .expect("send initialized notification");
+
+    client
+        .send(message(json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/list",
+        })))
+        .await
+        .expect("send tools/list");
+    let listed = response_value(client.receive().await.expect("tools/list response"));
 
     client
         .send(message(json!({
@@ -356,7 +390,17 @@ async fn results_for_protocol(protocol_version: &str) -> (Value, Value) {
         .expect("server should stop when the transport closes")
         .expect("join server");
     assert_eq!(runtime.shutdowns(), 1);
-    (success, response)
+    (listed, success, response)
+}
+
+fn invalid_arguments_structured_content() -> Value {
+    json!({
+        "code": "invalid_arguments",
+        "message": "missing required argument \"type\"",
+        "outcome": "not_started",
+        "retryable": true,
+        "recovery": "Correct the arguments using the tool input schema, then retry.",
+    })
 }
 
 fn runtime_error_structured_content() -> Value {
